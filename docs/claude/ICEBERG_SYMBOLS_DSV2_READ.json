@@ -1,0 +1,450 @@
+{
+  "_metadata": {
+    "description": "Symbol index for Iceberg Spark DataSource V2 read path",
+    "version": "1.0",
+    "sparkVersions": ["v3.4", "v3.5", "v4.0", "v4.1"],
+    "basePath": "spark/v{version}/spark/src/main/java/org/apache/iceberg/spark"
+  },
+  "entryPoints": {
+    "IcebergSource": {
+      "path": "source/IcebergSource.java",
+      "implements": ["DataSourceRegister", "SupportsCatalogOptions", "SessionConfigSupport"],
+      "methods": {
+        "shortName": "Returns 'iceberg' - the data source name",
+        "inferSchema": "Returns null; schema comes from table metadata",
+        "inferPartitioning": "Gets partitioning from table",
+        "getTable": "Returns SparkTable instance for the given identifier"
+      },
+      "notes": "Entry point for Spark SQL 'format(\"iceberg\")' and catalog access"
+    }
+  },
+  "tableAbstraction": {
+    "SparkTable": {
+      "path": "source/SparkTable.java",
+      "implements": ["Table", "SupportsRead", "SupportsWrite", "SupportsDeleteV2", "SupportsRowLevelOperations", "SupportsMetadataColumns"],
+      "fields": {
+        "icebergTable": "Underlying Iceberg Table instance",
+        "snapshotId": "Optional Long for time-travel reads",
+        "branch": "String branch reference",
+        "refreshEagerly": "Boolean for eager metadata refresh"
+      },
+      "methods": {
+        "newScanBuilder": "Creates SparkScanBuilder; handles branch/snapshot options",
+        "schema": "Returns Spark StructType from Iceberg schema",
+        "partitioning": "Returns Spark Transform[] from Iceberg PartitionSpec",
+        "capabilities": "Returns table capabilities set",
+        "name": "Returns fully qualified table name"
+      },
+      "notes": "Central table wrapper; routes to SparkScanBuilder or SparkStagedScanBuilder"
+    }
+  },
+  "scanBuilding": {
+    "SparkScanBuilder": {
+      "path": "source/SparkScanBuilder.java",
+      "implements": ["ScanBuilder", "SupportsPushDownV2Filters", "SupportsPushDownRequiredColumns", "SupportsPushDownAggregates", "SupportsReportStatistics", "SupportsPushDownLimit"],
+      "fields": {
+        "spark": "SparkSession reference",
+        "table": "Iceberg Table",
+        "schema": "Current Schema (pruned during pushdown)",
+        "readConf": "SparkReadConf with read options",
+        "filterExpressions": "List<Expression> - pushed Iceberg expressions",
+        "pushedPredicates": "Predicate[] - successfully pushed",
+        "metaColumns": "Set<String> - requested metadata columns"
+      },
+      "methods": {
+        "pushPredicates": "Converts Spark Predicates to Iceberg Expressions; classifies as partition/record/unsupported",
+        "pushedPredicates": "Returns array of successfully pushed predicates",
+        "pruneColumns": "Filters requestedSchema to required columns; extracts metadata columns",
+        "pushAggregation": "Pushes COUNT/MIN/MAX; creates SparkLocalScan if successful",
+        "pushLimit": "Sets row limit optimization",
+        "build": "Creates SparkBatchQueryScan via buildBatchScan()",
+        "buildIcebergBatchScan": "Creates underlying Iceberg BatchScan with all options"
+      },
+      "keyLines": {
+        "pushPredicates": "~151-195",
+        "pruneColumns": "~329-346",
+        "pushAggregation": "~207-271",
+        "build": "~401-419",
+        "buildIcebergBatchScan": "~421-466"
+      },
+      "notes": "3-way filter classification: partition-level (Iceberg only), record-level (both), unsupported (Spark only)"
+    }
+  },
+  "scanObjects": {
+    "SparkScan": {
+      "path": "source/SparkScan.java",
+      "implements": ["Scan"],
+      "methods": {
+        "toBatch": "Creates SparkBatch from task groups",
+        "estimateStatistics": "Returns Statistics with row count, size, column stats",
+        "reportDriverMetrics": "Reports manifest/file counts and planning duration",
+        "readSchema": "Returns expected StructType for readers"
+      },
+      "notes": "Abstract base class for all Spark scans"
+    },
+    "SparkPartitioningAwareScan": {
+      "path": "source/SparkPartitioningAwareScan.java",
+      "extends": "SparkScan",
+      "fields": {
+        "scan": "Underlying Iceberg Scan",
+        "tasks": "Cached List<FileScanTask>",
+        "taskGroups": "Cached List<ScanTaskGroup>"
+      },
+      "methods": {
+        "tasks": "Returns FileScanTasks via scan.planFiles(); lazy cached",
+        "taskGroups": "Groups tasks via TableScanUtil.planTaskGroups(); supports data grouping"
+      },
+      "keyLines": {
+        "tasks": "~172",
+        "taskGroups": "~197-235"
+      },
+      "notes": "Handles task planning with optional partition-based grouping for KeyGroupedPartitioning"
+    },
+    "SparkBatchQueryScan": {
+      "path": "source/SparkBatchQueryScan.java",
+      "extends": "SparkPartitioningAwareScan",
+      "implements": ["SupportsRuntimeV2Filtering"],
+      "methods": {
+        "filter": "Applies runtime filters from broadcast joins; filters tasks by partition",
+        "filterAttributes": "Returns partition column references",
+        "outputPartitioning": "Returns KeyGroupedPartitioning if data grouping enabled"
+      },
+      "keyLines": {
+        "filter": "~127-164"
+      },
+      "notes": "Main query scan implementation; supports runtime filtering for broadcast join optimization"
+    }
+  },
+  "batchExecution": {
+    "SparkBatch": {
+      "path": "source/SparkBatch.java",
+      "implements": ["Batch"],
+      "methods": {
+        "planInputPartitions": "Creates SparkInputPartition[]; broadcasts table; computes locations",
+        "createReaderFactory": "Returns SparkColumnarReaderFactory or SparkRowReaderFactory"
+      },
+      "keyLines": {
+        "planInputPartitions": "~84-107",
+        "createReaderFactory": "~124-137"
+      },
+      "notes": "Coordinates batch execution; decides vectorized vs row reading"
+    },
+    "SparkInputPartition": {
+      "path": "source/SparkInputPartition.java",
+      "implements": ["InputPartition", "HasPartitionKey"],
+      "fields": {
+        "taskGroup": "ScanTaskGroup<T> with tasks",
+        "tableBroadcast": "Broadcast<Table> for executors",
+        "expectedSchemaString": "JSON-serialized schema",
+        "preferredLocations": "String[] location hints",
+        "groupingKeyType": "StructType for partition key"
+      },
+      "methods": {
+        "preferredLocations": "Returns location hints for scheduler",
+        "partitionKey": "Returns StructInternalRow with grouping key",
+        "taskGroup": "Returns task group",
+        "table": "Dereferences broadcast",
+        "expectedSchema": "Deserializes schema from JSON"
+      },
+      "notes": "Serializable work unit sent to executors; contains all info needed for reading"
+    }
+  },
+  "readerFactories": {
+    "SparkRowReaderFactory": {
+      "path": "source/SparkRowReaderFactory.java",
+      "implements": ["PartitionReaderFactory"],
+      "methods": {
+        "createReader": "Creates RowDataReader, ChangelogRowReader, or PositionDeletesRowReader based on task type",
+        "supportColumnarReads": "Returns false"
+      },
+      "notes": "Used when vectorization not applicable"
+    },
+    "SparkColumnarReaderFactory": {
+      "path": "source/SparkColumnarReaderFactory.java",
+      "implements": ["PartitionReaderFactory"],
+      "constructors": {
+        "ParquetBatchReadConf": "For Parquet vectorized (Iceberg/Comet)",
+        "OrcBatchReadConf": "For ORC vectorized"
+      },
+      "methods": {
+        "createColumnarReader": "Creates BatchDataReader",
+        "supportColumnarReads": "Returns true"
+      },
+      "notes": "Used for Parquet/ORC with vectorization enabled"
+    }
+  },
+  "readers": {
+    "RowDataReader": {
+      "path": "source/RowDataReader.java",
+      "extends": "BaseRowReader<FileScanTask>",
+      "implements": ["PartitionReader<InternalRow>"],
+      "methods": {
+        "open": "Opens InputFile; creates SparkDeleteFilter; returns filtered InternalRow iterator",
+        "next": "Advances to next row",
+        "get": "Returns current InternalRow",
+        "close": "Closes resources"
+      },
+      "notes": "Row-level reading with delete file handling"
+    },
+    "BatchDataReader": {
+      "path": "source/BatchDataReader.java",
+      "extends": "BaseBatchReader",
+      "implements": ["PartitionReader<ColumnarBatch>"],
+      "methods": {
+        "next": "Advances to next batch",
+        "get": "Returns current ColumnarBatch",
+        "close": "Closes resources"
+      },
+      "notes": "Vectorized reading for Parquet (Iceberg/Comet) and ORC"
+    }
+  },
+  "filterConversion": {
+    "SparkV2Filters": {
+      "path": "SparkV2Filters.java",
+      "methods": {
+        "convert": "Converts Spark Predicate to Iceberg Expression; returns null if unsupported"
+      },
+      "supportedOperations": {
+        "comparison": ["=", "<=>", "<>", "<", "<=", ">", ">="],
+        "membership": ["IN", "NOT IN"],
+        "null": ["IS NULL", "IS NOT NULL"],
+        "string": ["STARTS_WITH"],
+        "logical": ["AND", "OR", "NOT"]
+      },
+      "supportedTransforms": ["years", "months", "days", "hours", "bucket", "truncate"],
+      "notes": "Central filter conversion; handles nested expressions recursively"
+    }
+  },
+  "configuration": {
+    "SparkReadConf": {
+      "path": "SparkReadConf.java",
+      "precedence": ["Read options", "Session config", "Table metadata"],
+      "methods": {
+        "branch": "Branch to read from",
+        "snapshotId": "Specific snapshot for time travel",
+        "asOfTimestamp": "Read as-of timestamp",
+        "startSnapshotId": "Incremental scan start",
+        "endSnapshotId": "Incremental scan end",
+        "caseSensitive": "Case sensitivity for filter binding",
+        "localityEnabled": "Compute block locations",
+        "executorCacheLocalityEnabled": "Use executor affinity for deletes",
+        "parquetVectorizationEnabled": "Enable Parquet vectorized reads",
+        "parquetReaderType": "ICEBERG, COMET, or NATIVE",
+        "orcVectorizationEnabled": "Enable ORC vectorized reads",
+        "splitSize": "Target bytes per split",
+        "splitLookback": "Files to consider for split decisions",
+        "preserveDataGrouping": "Enable partition key grouping",
+        "distributedPlanningEnabled": "Use distributed scan planning",
+        "reportColumnStats": "Report column stats to CBO"
+      },
+      "notes": "Centralized read configuration with precedence-based resolution"
+    }
+  },
+  "coreModule": {
+    "basePath": "core/src/main/java/org/apache/iceberg",
+    "scanClasses": {
+      "DataTableScan": {
+        "path": "DataTableScan.java",
+        "extends": "BaseTableScan",
+        "methods": {
+          "doPlanFiles": "Creates ManifestGroup; applies filtering; returns manifestGroup.planFiles()"
+        },
+        "keyLines": {
+          "doPlanFiles": "~64-92"
+        },
+        "notes": "Main table scan implementation"
+      },
+      "BaseTableScan": {
+        "path": "BaseTableScan.java",
+        "extends": "SnapshotScan",
+        "methods": {
+          "planTasks": "Calls planFiles() then splits/combines into CombinedScanTask"
+        }
+      },
+      "SnapshotScan": {
+        "path": "SnapshotScan.java",
+        "methods": {
+          "planFiles": "Wraps doPlanFiles with metrics/events"
+        },
+        "keyLines": {
+          "planFiles": "~138-182"
+        }
+      }
+    },
+    "manifestProcessing": {
+      "ManifestGroup": {
+        "path": "ManifestGroup.java",
+        "configMethods": {
+          "schemasById": "Map of schema versions",
+          "specsById": "Map of partition specs",
+          "filterData": "Row filter (AND combined)",
+          "filterFiles": "DataFile struct filter",
+          "filterPartitions": "Partition filter",
+          "caseSensitive": "Case sensitivity flag",
+          "planWith": "Executor for parallel processing"
+        },
+        "methods": {
+          "planFiles": "Returns CloseableIterable<FileScanTask>",
+          "plan": "Core planning with task creation function",
+          "entries": "Returns raw manifest entries"
+        },
+        "keyLines": {
+          "planFiles": "~176",
+          "plan": "~180-220",
+          "filteringPipeline": "~247-362"
+        },
+        "notes": "Central manifest processing; creates FileScanTasks with residuals and deletes"
+      },
+      "DeleteFileIndex": {
+        "path": "DeleteFileIndex.java",
+        "fields": {
+          "globalDeletes": "EqualityDeletes applying to all files",
+          "eqDeletesByPartition": "Partition-specific equality deletes",
+          "posDeletesByPartition": "Partition-specific position deletes",
+          "posDeletesByPath": "Path-specific position deletes",
+          "dvByPath": "Deletion vector files"
+        },
+        "methods": {
+          "forDataFile": "Returns delete files for given data file",
+          "forEntry": "Returns delete files for manifest entry",
+          "builderFor": "Creates builder for index construction"
+        },
+        "notes": "Associates delete files with data files by partition and path"
+      }
+    },
+    "taskClasses": {
+      "BaseFileScanTask": {
+        "path": "BaseFileScanTask.java",
+        "fields": {
+          "file": "DataFile to scan",
+          "deletes": "DeleteFile[] associated",
+          "residuals": "ResidualEvaluator"
+        },
+        "innerClasses": {
+          "SplitScanTask": "Split portion of file; mergeable"
+        },
+        "keyLines": {
+          "SplitScanTask": "~92-192"
+        }
+      },
+      "BaseCombinedScanTask": {
+        "path": "BaseCombinedScanTask.java",
+        "methods": {
+          "files": "Returns immutable list of tasks",
+          "sizeBytes": "Sum of all task sizes",
+          "estimatedRowsCount": "Sum of all row counts",
+          "filesCount": "Sum of all file counts"
+        }
+      }
+    },
+    "utilities": {
+      "TableScanUtil": {
+        "path": "util/TableScanUtil.java",
+        "methods": {
+          "splitFiles": "Splits files using FileScanTask.split()",
+          "planTasks": "Bin-packs splits into CombinedScanTask",
+          "planTaskGroups": "Groups tasks with optional partition key"
+        },
+        "keyLines": {
+          "splitFiles": "~75-83",
+          "planTasks": "~85-102"
+        },
+        "notes": "Bin-packing with weight function including delete file size"
+      }
+    }
+  },
+  "expressionEvaluation": {
+    "basePath": "api/src/main/java/org/apache/iceberg/expressions",
+    "classes": {
+      "Binder": {
+        "path": "Binder.java",
+        "methods": {
+          "bind": "Binds expression to schema; validates types",
+          "isBound": "Checks if expression is bound",
+          "boundReferences": "Finds referenced field IDs"
+        },
+        "notes": "Replaces UnboundPredicate with bound versions"
+      },
+      "Evaluator": {
+        "path": "Evaluator.java",
+        "methods": {
+          "eval": "Evaluates bound expression on StructLike row"
+        },
+        "notes": "Row-level expression evaluation"
+      },
+      "ResidualEvaluator": {
+        "path": "ResidualEvaluator.java",
+        "methods": {
+          "unpartitioned": "For unpartitioned tables (returns unchanged)",
+          "of": "For partitioned tables",
+          "residualFor": "Computes residual expression for partition"
+        },
+        "notes": "Partially evaluates filter using partition values"
+      },
+      "ManifestEvaluator": {
+        "path": "ManifestEvaluator.java",
+        "methods": {
+          "forRowFilter": "Projects row filter to partition level",
+          "forPartitionFilter": "Direct partition filter",
+          "eval": "Returns true if manifest MAY contain matches"
+        },
+        "notes": "Manifest-level pruning using partition statistics"
+      },
+      "InclusiveMetricsEvaluator": {
+        "path": "InclusiveMetricsEvaluator.java",
+        "methods": {
+          "eval": "Returns false only if NO rows can match"
+        },
+        "notes": "File-level pruning; inclusive (may contain matches)"
+      },
+      "StrictMetricsEvaluator": {
+        "path": "StrictMetricsEvaluator.java",
+        "methods": {
+          "eval": "Returns true only if ALL rows match"
+        },
+        "notes": "File-level pruning; strict (guaranteed matches)"
+      },
+      "Projections": {
+        "path": "Projections.java",
+        "methods": {
+          "inclusive": "If row matches → partition matches",
+          "strict": "If partition matches → all rows match"
+        },
+        "notes": "Projects row-level expressions to partition-level"
+      }
+    }
+  },
+  "statistics": {
+    "Stats": {
+      "path": "source/Stats.java",
+      "implements": ["Statistics"],
+      "fields": {
+        "sizeInBytes": "OptionalLong",
+        "numRows": "OptionalLong",
+        "colstats": "Map<NamedReference, ColumnStatistics>"
+      },
+      "notes": "Statistics implementation for CBO"
+    },
+    "SparkColumnStatistics": {
+      "path": "source/SparkColumnStatistics.java",
+      "notes": "Wraps NDV from puffin statistics files"
+    }
+  },
+  "utilities": {
+    "SparkSchemaUtil": {
+      "path": "SparkSchemaUtil.java",
+      "methods": {
+        "prune": "Prunes schema to required columns",
+        "convert": "Converts Spark StructType to Iceberg Schema",
+        "estimateSize": "Estimates row size from schema"
+      }
+    },
+    "SparkPlanningUtil": {
+      "path": "source/SparkPlanningUtil.java",
+      "methods": {
+        "fetchBlockLocations": "Gets HDFS block locations",
+        "assignExecutors": "Assigns executors based on partition hash"
+      }
+    }
+  }
+}
