@@ -43,13 +43,16 @@ nav:
     - Javadoc: ../../javadoc/latest/
   - Integrations:
     - Apache Spark:
+      - spark-integration-overview.md
       - spark-getting-started.md
+      - spark-integration-architecture.md
       - spark-configuration.md
       - spark-ddl.md
       - spark-procedures.md
       - spark-queries.md
       - spark-structured-streaming.md
       - spark-writes.md
+      - spark-integration-configuration.md
     - Apache Flink:
       - flink.md
       - flink-connector.md
