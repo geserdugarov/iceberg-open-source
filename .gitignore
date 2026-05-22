@@ -79,3 +79,10 @@ derby.log
 
 # git hooks like pre-commit
 .githooks/
+
+# agents related
+.claude/
+.codex
+.develop-review-loop/
+plans/task-*.md
+
