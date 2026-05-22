@@ -82,3 +82,8 @@ derby.log
 
 # claude code
 .claude/
+
+# agents related
+.codex
+.develop-review-loop/
+
