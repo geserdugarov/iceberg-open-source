@@ -2,6 +2,8 @@
 
 This document provides a high-level architecture overview of Apache Iceberg, excluding the Native Layer modules.
 
+**Related docs:** [read_path_callstack.md](read_path_callstack.md) | [write_path_callstack.md](write_path_callstack.md) | [compaction_callstack.md](compaction_callstack.md) | [delete_mechanisms.md](delete_mechanisms.md) | [update_and_merge_mechanisms.md](update_and_merge_mechanisms.md) | [indexing.md](indexing.md)
+
 ---
 
 ## 1. Layered Architecture
@@ -96,14 +98,16 @@ iceberg/
 ├── data/                   Direct JVM data read/write, BaseFileWriterFactory
 │
 ├── spark/                  Spark DataSourceV2 integration
-│   ├── v3.5/               (primary development target)
+│   ├── v3.5/
 │   ├── v4.0/
-│   └── v4.1/
+│   └── v4.1/               (default build target — see gradle.properties:
+│                            defaultSparkVersions=4.1, known=3.5/4.0/4.1)
 │
 ├── flink/                  Flink integration
 │   ├── v1.20/
 │   ├── v2.0/
-│   └── v2.1/
+│   └── v2.1/               (default build target — see gradle.properties:
+│                            defaultFlinkVersions=2.1, known=1.20/2.0/2.1)
 │
 ├── mr/                     Hadoop MapReduce InputFormat
 ├── hive-metastore/         Hive metastore Thrift client

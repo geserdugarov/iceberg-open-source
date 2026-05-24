@@ -2,7 +2,7 @@
 
 This document provides a comprehensive description of how Apache Iceberg handles row-level deletes across format versions V2 and V3, covering Position Deletes, Equality Deletes, and Deletion Vectors (DVs).
 
-**Related docs:** [architecture_overview.md](architecture_overview.md) | [read_path_callstack.md](read_path_callstack.md) | [write_path_callstack.md](write_path_callstack.md) | [compaction_callstack.md](compaction_callstack.md)
+**Related docs:** [architecture_overview.md](architecture_overview.md) | [read_path_callstack.md](read_path_callstack.md) | [write_path_callstack.md](write_path_callstack.md) | [compaction_callstack.md](compaction_callstack.md) | [indexing.md](indexing.md)
 
 ---
 
@@ -243,7 +243,11 @@ Planning (Driver):
     └─► DeleteFileIndex.forDataFile(seqNum, dataFile)
           │
           ├─► Find position deletes scoped to this data file's path
-          ├─► Filter by sequence number: delete.seqNum > data.seqNum
+          ├─► Filter by sequence number: include the delete when
+          │     delete.seqNum >= data.seqNum
+          │     (position deletes apply at equal sequence numbers too,
+          │      so a position delete in the same commit as the data
+          │      file can remove rows it added)
           └─► Return DeleteFile[] associated with this data file
 
 Execution (Per-Task on Executors):
@@ -622,9 +626,18 @@ DataTableScan.planFiles()                                    [core/DataTableScan
               │     entry.dataSequenceNumber(),
               │     entry.file())
               │       │
-              │       ├─► Sequence number filtering:
-              │       │     include delete only if
-              │       │     delete.dataSequenceNumber > data.dataSequenceNumber
+              │       ├─► Sequence number filtering (per format spec
+              │       │   §"Scan Planning"; rule depends on delete type):
+              │       │     • Equality delete file applies iff
+              │       │         equality.dataSequenceNumber
+              │       │           > data.dataSequenceNumber   (strict)
+              │       │     • Position delete file / DV applies iff
+              │       │         delete.dataSequenceNumber
+              │       │           >= data.dataSequenceNumber  (allow equal)
+              │       │   The equal case is required so position deletes /
+              │       │   DVs written in the same commit can remove rows
+              │       │   added by that commit (positions are absolute
+              │       │   file/offset references, so this is unambiguous).
               │       │
               │       ├─► For position deletes: match by partition
               │       ├─► For equality deletes: match by partition + field scope
@@ -643,21 +656,42 @@ DataTableScan.planFiles()                                    [core/DataTableScan
 
 ### Sequence Number Rule
 
+The applicability rule depends on the delete type (per `format/spec.md` §"Scan Planning"):
+
+- **Equality delete file** applies to a data file iff
+  `equality_delete.dataSequenceNumber > data_file.dataSequenceNumber`
+  (strict `>`). This prevents a same-commit equality delete from removing
+  rows added by that commit, which would otherwise be ambiguous.
+- **Position delete file** and **deletion vector** apply iff
+  `delete.dataSequenceNumber >= data_file.dataSequenceNumber`
+  (allow equal). The equal case is required so that position deletes /
+  DVs written in the same commit can remove rows that the same commit
+  added — positions are absolute `(file_path, pos)` references, so this
+  is unambiguous.
+
 ```
 Timeline:
 
   Snapshot 1 (seq=1):  data-file-A added
   Snapshot 2 (seq=2):  data-file-B added
-  Snapshot 3 (seq=3):  delete-file-X added (deletes from data-file-A)
+  Snapshot 3 (seq=3):  delete-X added (deletes from data-file-A)
   Snapshot 4 (seq=4):  data-file-C added
 
-  delete-file-X.dataSequenceNumber = 3
+  delete-X.dataSequenceNumber = 3
 
-  Applies to data-file-A?  YES  (3 > 1)
-  Applies to data-file-B?  YES  (3 > 2)
-  Applies to data-file-C?  NO   (3 < 4)  ◄── data added AFTER the delete
+  If delete-X is an equality delete:
+    Applies to data-file-A?  YES  (3 > 1)
+    Applies to data-file-B?  YES  (3 > 2)
+    Applies to data-file-C?  NO   (3 not > 4)
 
-  This prevents retroactive application of deletes to newer data.
+  If delete-X is a position delete or DV:
+    Applies to data-file-A?  YES  (3 >= 1)
+    Applies to data-file-B?  YES  (3 >= 2)
+    Applies to data-file-C?  NO   (3 not >= 4)
+    (and would also apply to any data file added in snapshot 3 itself)
+
+  Both rules prevent retroactive application of deletes to newer data;
+  they differ only on equal sequence numbers.
 ```
 
 ### Execution Phase (Executors)
@@ -904,7 +938,7 @@ Time ─────────────────────────
 | Operation                    | Purpose                                                      | API                                                            |
 |------------------------------|--------------------------------------------------------------|----------------------------------------------------------------|
 | `RewriteDataFiles`           | Compact data files, applying pending deletes                 | `SparkActions.rewriteDataFiles()`                              |
-| `RemoveDanglingDeletes`      | Remove delete files that no longer reference live data       | `rewriteDataFiles().option("remove-dangling-deletes", "true")` |
+| `RemoveDanglingDeleteFiles`  | Remove delete files that no longer reference live data (impl `RemoveDanglingDeletesSparkAction`) | `rewriteDataFiles().option("remove-dangling-deletes", "true")` |
 | `ExpireSnapshots`            | Remove old snapshots, enabling GC of unreferenced files      | `SparkActions.expireSnapshots()`                               |
 | `RemoveOrphanFiles`          | Delete files not referenced by any snapshot                  | `SparkActions.removeOrphanFiles()`                             |
 | `RewritePositionDeleteFiles` | Rewrite fragmented position delete files for better locality | `SparkActions.rewritePositionDeletes()`                        |

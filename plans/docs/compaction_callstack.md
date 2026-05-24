@@ -337,8 +337,11 @@ ExpireSnapshots (removes old snapshots):
       └─► removes unreferenced snapshots
           └─► allows GC of old data files replaced by compaction
 
-RemoveDanglingDeletes (if enabled in RewriteDataFiles):
+RemoveDanglingDeleteFiles (action interface in api/.../actions;
+implementation: RemoveDanglingDeletesSparkAction in spark/.../actions):
   └─► removes delete files that no longer reference any live data files
+  └─► also triggered when RewriteDataFiles is run with
+      .option("remove-dangling-deletes", "true")
 ```
 
 ---
