@@ -33,7 +33,8 @@ This document traces the complete write path from a Spark SQL INSERT to Parquet 
                     └───────────┬───────────┘
                                 │
                                 │ createBatchWriterFactory()
-                                │ → broadcast WriterFactory
+                                │ → broadcast SerializableTableWithSize
+                                │   ship WriterFactory to executors
                                 │
          ┌──────────────────────┴─────────────────────────┐
          │                                                │
@@ -77,7 +78,8 @@ This document traces the complete write path from a Spark SQL INSERT to Parquet 
               │       │               │
               │       ▼               │
               │  AppendFiles          │
-              │  (FastAppend)         │
+              │  (MergeAppend, via    │
+              │   table.newAppend())  │
               │    .appendFile(f)     │
               │    .commit()          │
               │       │               │
@@ -119,45 +121,60 @@ SparkWriteBuilder                                                [spark/source/S
 ### Phase 2: Writer Factory Creation (Driver)
 
 ```
-BatchAppend.createBatchWriterFactory(PhysicalWriteInfo)          [spark/source/SparkWrite]
+BaseBatchWrite.createBatchWriterFactory(PhysicalWriteInfo)       [spark/source/SparkWrite]
+  │   (inherited by BatchAppend / DynamicOverwrite / OverwriteByFilter)
   │
   └─► createWriterFactory()                                      [SparkWrite]
         │
-        ├─► new SparkFileWriterFactory(...)                      [spark/source/SparkFileWriterFactory]
-        │     extends RegistryBasedFileWriterFactory              [data/RegistryBasedFileWriterFactory]
-        │       <InternalRow, StructType>
-        │     │
-        │     └─► configures:
-        │           table, fileFormat, schema, spec,
-        │           io, encryptionManager, targetFileSize,
-        │           writeProperties
+        ├─► sparkContext.broadcast(
+        │       SerializableTableWithSize.copyOf(table))         broadcast table to executors
         │
-        │     (RegistryBasedFileWriterFactory resolves per-format
-        │      writer builders via FormatModelRegistry, so the
-        │      Spark-specific `SparkParquetWriters` / `SparkOrcWriter`
-        │      are registered once in SparkFormatModels.register()
-        │      rather than referenced inline from this factory.)
-        │
-        └─► new WriterFactory(fileWriterFactory, fileFormat,
-                              targetFileSize, writeSchema,
-                              dsSchema, partitioned, fanout)
+        └─► new WriterFactory(tableBroadcast, queryId, format,
+                              outputSpecId, targetFileSize,
+                              writeSchema, dsSchema,
+                              useFanoutWriter, writeProperties,
+                              sortOrderId)
               │
-              └─► serialized & broadcast to executors
+              └─► serialized & shipped to executors with each task
+                  (the per-format SparkFileWriterFactory is built
+                   lazily on the executor in createWriter(); see
+                   Phase 3.)
 ```
 
 ### Phase 3: Per-Task Writing (Executors)
 
 ```
-WriterFactory.createWriter(partitionId, taskId)                  [spark/source/SparkWrite]
+WriterFactory.createWriter(partitionId, taskId[, epochId])       [spark/source/SparkWrite]
   │
-  ├─► if unpartitioned:
+  ├─► table = tableBroadcast.value()                             resolve broadcast table
+  ├─► spec  = table.specs().get(outputSpecId)
+  │
+  ├─► OutputFileFactory.builderFor(table, partitionId, taskId)
+  │       .format(format).operationId(queryId + "-" + epochId)
+  │       .build()                                               file naming / paths
+  │
+  ├─► SparkFileWriterFactory.builderFor(table)                   [spark/source/SparkFileWriterFactory]
+  │       .dataFileFormat(format)                                  extends RegistryBasedFileWriterFactory
+  │       .dataSchema(writeSchema)                                   <InternalRow, StructType>
+  │       .dataSparkType(dsSchema)
+  │       .writeProperties(writeProperties)
+  │       .dataSortOrder(table.sortOrders().get(sortOrderId))
+  │       .build()
+  │
+  │     (RegistryBasedFileWriterFactory resolves per-format
+  │      writer builders via FormatModelRegistry, so the
+  │      Spark-specific `SparkParquetWriters` / `SparkOrcWriter`
+  │      are registered once in SparkFormatModels.register()
+  │      rather than referenced inline from this factory.)
+  │
+  ├─► if spec.isUnpartitioned():
   │     └─► new UnpartitionedDataWriter(...)
   │           └─► wraps RollingDataWriter<InternalRow>
   │
-  └─► if partitioned:
+  └─► else (partitioned):
         └─► new PartitionedDataWriter(...)
               │
-              ├─► if fanoutEnabled:
+              ├─► if useFanoutWriter:
               │     └─► wraps FanoutDataWriter<InternalRow>
               │           (keeps one writer open per partition seen)
               │
@@ -165,17 +182,29 @@ WriterFactory.createWriter(partitionId, taskId)                  [spark/source/S
                     └─► wraps ClusteredDataWriter<InternalRow>
                           (expects rows sorted by partition)
 
+  (Version note: in spark/v3.5 these wrappers are plain
+   `DataWriter<InternalRow>` and call `delegate.write(record, ...)`
+   directly with no lineage decoration. In spark/v4.0 and
+   spark/v4.1 they extend `DataWriterWithLineage<InternalRow>`,
+   which adds `decorateWithRowLineage(meta, record)` on the
+   write path shown below.)
+
 DataWriter.write(InternalRow row)                                [spark/source/SparkWrite]
   │
   ├─► UnpartitionedDataWriter:
-  │     └─► rollingWriter.write(row)
+  │     └─► rollingWriter.write(record)                          v3.5
+  │         rollingWriter.write(decorateWithRowLineage(meta,     v4.0 / v4.1
+  │                                                    record))
   │           ├─► if currentWriter == null || file >= targetSize:
   │           │     closeCurrentWriter()
   │           │     openNewWriter()                              (rolls to new file)
   │           └─► currentWriter.write(row)
   │
   └─► PartitionedDataWriter:
-        └─► partitioningWriter.write(row, spec, partition)
+        ├─► partitionKey.partition(internalRowWrapper.wrap(row)) compute partition key
+        └─► delegate.write(record, spec, partitionKey)           v3.5
+            delegate.write(decorateWithRowLineage(meta, record), v4.0 / v4.1
+                           spec, partitionKey)
               ├─► route to partition-specific writer
               └─► writer.write(row)
 ```
@@ -224,40 +253,49 @@ ParquetWriter<InternalRow>                                       [parquet/Parque
         ├─► writeStore.endRecord()                               buffer in page store
         │
         └─► checkSize()
-              └─► if buffered >= targetRowGroupSize:
-                    flushRowGroup()
-                      └─► ParquetFileWriter.startBlock(rowCount)
-                          columnChunkPageWriteStore.flushToWriter()
-                          ParquetFileWriter.endBlock()
+              └─► if buffered ≈ targetRowGroupSize:
+                    flushRowGroup(false)
+                      ├─► writer.startBlock(recordCount)         ParquetFileWriter
+                      ├─► writeStore.flush()
+                      ├─► pageStore.flushToFileWriter(writer)    ColumnChunkPageWriteStore
+                      └─► writer.endBlock()
 
-  close()
-    ├─► flush remaining rows
-    ├─► write Parquet footer (schema, row group metadata, stats)
-    └─► collect metrics (record count, file size, column stats)
-          └─► returns Metrics object
+  close()  → void
+    ├─► flushRowGroup(true)                                      drain remaining records
+    ├─► writeStore.close()
+    └─► writer.end(metadata)                                     write Parquet footer
+                                                                  (schema, row groups, stats)
+
+  metrics()  → Metrics                                           called after close() by the
+    └─► ParquetMetrics.metrics(schema, parquetSchema,            wrapping DataWriter while
+          metricsConfig, writer.getFooter(), model.metrics())    building the DataFile
 ```
 
 ### Phase 5: Task Commit (Executors → Driver)
 
 ```
-DataWriter.commit()                                              [spark/source/SparkWrite]
+Unpartitioned/PartitionedDataWriter.commit()                     [spark/source/SparkWrite]
   │
-  ├─► close underlying writers
+  ├─► close()                                                    closes the delegate writer
   │
-  ├─► collect DataFile[] from write results:
-  │     DataFile
-  │       ├─ filePath
-  │       ├─ fileFormat (PARQUET)
-  │       ├─ partition
-  │       ├─ recordCount
-  │       ├─ fileSizeInBytes
-  │       ├─ columnSizes
-  │       ├─ valueCounts
-  │       ├─ nullValueCounts
-  │       ├─ lowerBounds
-  │       └─ upperBounds
+  ├─► DataWriteResult result = delegate.result()
+  │     └─► collect DataFile[] produced by the writer:
+  │           DataFile
+  │             ├─ filePath
+  │             ├─ fileFormat (PARQUET / ORC / AVRO)
+  │             ├─ partition
+  │             ├─ recordCount
+  │             ├─ fileSizeInBytes
+  │             ├─ columnSizes
+  │             ├─ valueCounts
+  │             ├─ nullValueCounts
+  │             ├─ lowerBounds
+  │             └─ upperBounds
   │
-  └─► return TaskCommit(DataFile[])                              WriterCommitMessage
+  ├─► TaskCommit taskCommit = new TaskCommit(result.dataFiles())
+  ├─► taskCommit.reportOutputMetrics()                           Spark output metrics
+  │
+  └─► return taskCommit                                          WriterCommitMessage
         └─► serialized, sent back to driver
 ```
 
@@ -269,13 +307,17 @@ BatchAppend.commit(WriterCommitMessage[] messages)               [spark/source/S
   ├─► collect all DataFile[] from TaskCommit messages
   │
   ├─► AppendFiles append = table.newAppend()                     [api/Table]
-  │     └─► new FastAppend(tableName, ops)                       [core/FastAppend]
+  │     └─► new MergeAppend(name, ops)                           [core/MergeAppend]
+  │           (BaseTable.newAppend() returns MergeAppend, which
+  │            extends MergingSnapshotProducer to keep the manifest
+  │            count low; FastAppend is only reachable via the
+  │            explicit table.newFastAppend() entry point.)
   │
   ├─► for each DataFile:
   │     append.appendFile(dataFile)
   │
   └─► commitOperation(append, description)                       [SparkWrite]
-        └─► append.commit()                                      [core/FastAppend]
+        └─► append.commit()                                      [core/MergeAppend]
               └─► SnapshotProducer.commit()                      [core/SnapshotProducer]
 
 SnapshotProducer.commit()                                        [core/SnapshotProducer]
@@ -320,51 +362,57 @@ SnapshotProducer.commit()                                        [core/SnapshotP
 ## 3. Write Variants
 
 ```
-┌─────────────────────┬───────────────────────┬─────────────────────────┐
-│  Operation          │  BatchWrite class     │  Iceberg SnapshotUpdate │
-├─────────────────────┼───────────────────────┼─────────────────────────┤
-│  INSERT INTO        │  BatchAppend          │  AppendFiles (FastAppend│
-│                     │                       │  or MergeAppend)        │
-├─────────────────────┼───────────────────────┼─────────────────────────┤
-│  INSERT OVERWRITE   │  DynamicOverwrite     │  ReplacePartitions      │
-│  (dynamic)          │                       │                         │
-├─────────────────────┼───────────────────────┼─────────────────────────┤
-│  INSERT OVERWRITE   │  OverwriteByFilter    │  OverwriteFiles         │
-│  (static)           │                       │                         │
-├─────────────────────┼───────────────────────┼─────────────────────────┤
-│  DELETE / UPDATE /  │  (via RowLevelOp)     │  RowDelta               │
-│  MERGE (MoR)        │                       │  (data + delete files)  │
-├─────────────────────┼───────────────────────┼─────────────────────────┤
-│  DELETE / UPDATE /  │  (via RowLevelOp)     │  OverwriteFiles         │
-│  MERGE (CoW)        │                       │  (full file rewrite)    │
-└─────────────────────┴───────────────────────┴─────────────────────────┘
+┌─────────────────────┬─────────────────────────────────┬─────────────────────────┐
+│  Operation          │  BatchWrite class               │  Iceberg SnapshotUpdate │
+├─────────────────────┼─────────────────────────────────┼─────────────────────────┤
+│  INSERT INTO        │  BatchAppend                    │  AppendFiles            │
+│                     │                                 │  (MergeAppend via       │
+│                     │                                 │   table.newAppend();    │
+│                     │                                 │   FastAppend via        │
+│                     │                                 │   table.newFastAppend())│
+├─────────────────────┼─────────────────────────────────┼─────────────────────────┤
+│  INSERT OVERWRITE   │  DynamicOverwrite               │  ReplacePartitions      │
+│  (dynamic)          │                                 │                         │
+├─────────────────────┼─────────────────────────────────┼─────────────────────────┤
+│  INSERT OVERWRITE   │  OverwriteByFilter              │  OverwriteFiles         │
+│  (static)           │                                 │                         │
+├─────────────────────┼─────────────────────────────────┼─────────────────────────┤
+│  DELETE / UPDATE /  │  SparkPositionDeltaOperation /  │  RowDelta               │
+│  MERGE (MoR)        │  PositionDeltaBatchWrite        │  (data + delete files)  │
+│                     │  (SparkPositionDeltaWrite)      │                         │
+├─────────────────────┼─────────────────────────────────┼─────────────────────────┤
+│  DELETE / UPDATE /  │  SparkCopyOnWriteOperation /    │  OverwriteFiles         │
+│  MERGE (CoW)        │  CopyOnWriteOperation           │  (full file rewrite)    │
+│                     │  (SparkWrite inner class)       │                         │
+└─────────────────────┴─────────────────────────────────┴─────────────────────────┘
 ```
 
 ---
 
 ## 4. Key Classes Reference
 
-| Step          | Class                     | Module       | Key Method                               |
-|---------------|---------------------------|--------------|------------------------------------------|
-| Entry         | `SparkTable`              | spark/source | `newWriteBuilder()`                      |
-| Config        | `SparkWriteBuilder`       | spark/source | `build()`                                |
-| Write         | `SparkWrite`              | spark/source | `toBatch()`                              |
-| Batch         | `BatchAppend`             | spark/source | `createBatchWriterFactory()`, `commit()` |
-| Factory       | `WriterFactory`           | spark/source | `createWriter()`                         |
-| Task writer   | `UnpartitionedDataWriter` | spark/source | `write()`, `commit()`                    |
-| Task writer   | `PartitionedDataWriter`   | spark/source | `write()`, `commit()`                    |
-| Rolling       | `RollingDataWriter`       | core/io      | file size rolling                        |
-| Fanout        | `FanoutDataWriter`        | core/io      | multi-partition write                    |
-| File factory  | `SparkFileWriterFactory`        | spark/source | `newDataWriter()`                                |
-| Base factory  | `RegistryBasedFileWriterFactory`| data         | format-agnostic factory (uses FormatModelRegistry)|
-| Format lookup | `FormatModelRegistry`           | core/formats | `dataWriteBuilder(format, type, file)`           |
-| Spark formats | `SparkFormatModels`             | spark/source | `register()` (one-time at startup)               |
-| Parquet write | `ParquetWriter`                 | parquet      | `add()`, `close()`                               |
-| Value encode  | `SparkParquetWriters`           | spark/data   | `buildWriter()` (registered via FormatModel)     |
-| Append        | `FastAppend`              | core         | `appendFile()`, `commit()`               |
-| Snapshot      | `SnapshotProducer`        | core         | `commit()`, `apply()`                    |
-| Manifest      | `ManifestWriter`          | core         | write manifest Avro                      |
-| Metadata      | `TableOperations`         | api/core     | `commit(base, updated)`                  |
+| Step          | Class                            | Module       | Key Method                                       |
+|---------------|----------------------------------|--------------|--------------------------------------------------|
+| Entry         | `SparkTable`                     | spark/source | `newWriteBuilder()`                              |
+| Config        | `SparkWriteBuilder`              | spark/source | `build()`                                        |
+| Write         | `SparkWrite`                     | spark/source | `toBatch()`                                      |
+| Batch         | `BatchAppend` / `DynamicOverwrite` / `OverwriteByFilter` | spark/source | `commit()` (`createBatchWriterFactory()` inherited from `BaseBatchWrite`) |
+| Factory       | `WriterFactory`                  | spark/source | `createWriter(partitionId, taskId[, epochId])`   |
+| Task writer   | `UnpartitionedDataWriter`        | spark/source | `write()`, `commit()`                            |
+| Task writer   | `PartitionedDataWriter`          | spark/source | `write()`, `commit()`                            |
+| Rolling       | `RollingDataWriter`              | core/io      | file size rolling                                |
+| Fanout        | `FanoutDataWriter`               | core/io      | multi-partition write                            |
+| Clustered     | `ClusteredDataWriter`            | core/io      | partition-sorted write                           |
+| File factory  | `SparkFileWriterFactory`         | spark/source | builder pattern (`builderFor(table)`)            |
+| Base factory  | `RegistryBasedFileWriterFactory` | data         | format-agnostic factory (uses FormatModelRegistry)|
+| Format lookup | `FormatModelRegistry`            | core/formats | `dataWriteBuilder(format, type, file)`           |
+| Spark formats | `SparkFormatModels`              | spark/source | `register()` (one-time at startup)               |
+| Parquet write | `ParquetWriter`                  | parquet      | `add()`, `close()`                               |
+| Value encode  | `SparkParquetWriters`            | spark/data   | `buildWriter()` (registered via FormatModel)     |
+| Append        | `MergeAppend` (via `newAppend()`); `FastAppend` (via `newFastAppend()`) | core | `appendFile()`, `commit()`                       |
+| Snapshot      | `SnapshotProducer`               | core         | `commit()`, `apply()`                            |
+| Manifest      | `ManifestWriter`                 | core         | write manifest Avro                              |
+| Metadata      | `TableOperations`                | core         | `commit(base, updated)`                          |
 
 ---
 
