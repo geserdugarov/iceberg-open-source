@@ -21,19 +21,24 @@ The MoR approach is faster for writes (avoids full file rewrites) but adds read 
 │                                                                            │
 │  ┌─────────────────────┐  ┌─────────────────────┐  ┌────────────────────┐  │
 │  │  Position Deletes   │  │  Equality Deletes   │  │ Deletion Vectors   │  │
-│  │  (V2+)              │  │  (V2+)              │  │ (V3+)              │  │
+│  │  (row-based, V2     │  │  (V2+)              │  │ (V3+)              │  │
+│  │   only — V3+ uses   │  │                     │  │                    │  │
+│  │   DVs instead)      │  │                     │  │                    │  │
 │  │                     │  │                     │  │                    │  │
-│  │  Parquet file with  │  │  Parquet file with  │  │  Puffin file with  │  │
-│  │  file_path + pos    │  │  data rows matching │  │  RoaringBitmap     │  │
-│  │  columns            │  │  equality fields    │  │  per data file     │  │
+│  │  Parquet/Avro/ORC   │  │  Parquet/Avro/ORC   │  │  Puffin file with  │  │
+│  │  file with          │  │  file with rows in  │  │  RoaringBitmap     │  │
+│  │  file_path + pos    │  │  equalityDeleteRow- │  │  per data file     │  │
+│  │  columns            │  │  Schema             │  │                    │  │
 │  │                     │  │                     │  │                    │  │
 │  │  Scope: per file    │  │  Scope: partition   │  │  Scope: per file   │  │
 │  │  Apply: O(1) bitmap │  │  Apply: hash lookup │  │  Apply: O(1) bitmap│  │
 │  └─────────────────────┘  └─────────────────────┘  └────────────────────┘  │
 │                                                                            │
 │  Format Version:  V1 = no deletes (append-only)                            │
-│                   V2 = position deletes + equality deletes                 │
-│                   V3 = adds deletion vectors (Puffin format)               │
+│                   V2 = row-based position deletes + equality deletes       │
+│                   V3+ = adds deletion vectors (Puffin); position deletes   │
+│                         MUST be DVs (MergingSnapshotProducer rejects       │
+│                         row-based position deletes in V3/V4)               │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -41,14 +46,14 @@ The MoR approach is faster for writes (avoids full file rewrites) but adds read 
 
 | Property                    | Position Deletes                      | Equality Deletes                                     | Deletion Vectors                                            |
 |-----------------------------|---------------------------------------|------------------------------------------------------|-------------------------------------------------------------|
-| **Format version**          | V2+                                   | V2+                                                  | V3+                                                         |
-| **File format**             | Parquet                               | Parquet                                              | Puffin (binary blob)                                        |
+| **Format version**          | V2 only (row-based position deletes are rejected in V3/V4 by `MergingSnapshotProducer.validateDeleteFileForVersion`; use DVs instead) | V2+ | V3+ (Puffin DVs are the V3/V4 carrier for positional deletes) |
+| **File format**             | Parquet / Avro / ORC (configurable via `write.delete.format.default`, falls back to data file format) | Parquet / Avro / ORC (same configuration) | Puffin (binary blob, V3+) |
 | **Content type**            | `POSITION_DELETES`                    | `EQUALITY_DELETES`                                   | `POSITION_DELETES`                                          |
 | **Scope**                   | Single data file (by `file_path`)     | All files in partition matching equality fields      | Single data file (by `referencedDataFile`)                  |
-| **Columns stored**          | `file_path` (string) + `pos` (long)   | All equality field columns (full rows)               | Serialized RoaringBitmap of positions                       |
+| **Columns stored**          | `file_path` (string) + `pos` (long)   | Configured `equalityDeleteRowSchema` (must contain equality fields; may be a projection of the table schema, may carry extra cols for metrics/sort) | Serialized RoaringBitmap of positions |
 | **Read-time cost**          | Low — bitmap lookup O(1) per row      | High — hash set lookup per row, loaded for all files | Lowest — compact bitmap, direct offset access               |
 | **Write-time cost**         | Low — record (path, pos) pairs        | Low — record matching rows                           | Low — set bits in bitmap                                    |
-| **Storage overhead**        | Moderate — one record per deleted row | High — full row per deleted row                      | Low — compressed bitmap                                     |
+| **Storage overhead**        | Moderate — one record per deleted row | Moderate–high — one schema-shaped record per deleted row | Low — compressed bitmap                                  |
 | **Metadata fields**         | `recordCount`, `fileSizeInBytes`      | `equalityFieldIds[]`, metrics                        | `referencedDataFile`, `contentOffset`, `contentSizeInBytes` |
 | **Multiple per data file?** | Yes (across multiple delete files)    | N/A (partition-scoped)                               | No (at most one DV per data file)                           |
 | **Practical usage**         | Primary V2 mechanism                  | Rarely used in practice                              | Preferred V3 mechanism                                      |
@@ -71,8 +76,10 @@ BEFORE:                                 AFTER:
                                         │  row C             │
                                         └────────────────────┘
 
-Snapshot: RewriteFiles (delete old file, add new file)
-No delete files produced.
+Snapshot: OverwriteFiles (deleted files + replacement files committed
+together via table.newOverwrite() in SparkWrite.CopyOnWriteOperation;
+the standalone RewriteFiles API is used by maintenance, not row-level
+CoW). No delete files produced.
 ```
 
 - **Write cost:** High — must read + rewrite entire data file(s) containing affected rows
@@ -152,12 +159,13 @@ Position deletes identify rows to remove by their **physical location**: the dat
 ### File Format
 
 ```
-Position Delete File (Parquet):
+Position Delete File (row-based):
 ┌───────────────────────────────────────────────┐
+│  Format: Parquet / Avro / ORC                 │  ◄── from write.delete.format.default
+│                                               │      (falls back to data file format)
 │  Schema:                                      │
 │    file_path: string (required)               │  ◄── MetadataColumns.DELETE_FILE_PATH
 │    pos:       long   (required)               │  ◄── MetadataColumns.DELETE_FILE_POS
-│    row:       struct (optional)               │  ◄── for change data capture
 │                                               │
 │  Row 0: ("s3://bucket/data-001.parquet", 42)  │
 │  Row 1: ("s3://bucket/data-001.parquet", 108) │
@@ -167,6 +175,15 @@ Position Delete File (Parquet):
 │  Sorted by: (file_path ASC, pos ASC)          │  ◄── required for efficient merge
 └───────────────────────────────────────────────┘
 ```
+
+Note: the optional `row` column (`DELETE_FILE_ROW_FIELD_*`) and the
+`PositionDelete.set(path, pos, row)` / `PositionDelete.row()` overloads
+are deprecated as of Iceberg 1.11.0 and will be removed in 1.12.0.
+The schema and data structure still accept the field for reading
+existing files and for code paths that have not migrated (e.g. legacy
+position-delete table reads and rewrites). New MoR row-level writes
+must not populate row data; CDC/changelog use cases are served by
+deletion vectors and changelog scans.
 
 ### Write Path
 
@@ -194,28 +211,55 @@ EXECUTOR:
   │     └─► PartitionedDeltaWriter     (UPDATE/MERGE partitioned)
   │
   └─► Delete writer selection (V2 tables):
+        │  Granularity comes from SparkWriteConf.deleteGranularity():
+        │    Spark default = DeleteGranularity.FILE
+        │    (TableProperties.DELETE_GRANULARITY_DEFAULT = PARTITION
+        │     applies only when consumers read the property directly;
+        │     SparkWriteConf overrides with .defaultValue(FILE))
         │
         ├─► if input ordered by (file, pos):
         │     ClusteredPositionDeleteWriter                  [core/io]
-        │       └─► wraps PositionDeleteWriter               [core/deletes]
-        │             └─► writes Parquet file with (file_path, pos) records
-        │             └─► tracks referencedDataFiles (CharSequenceSet)
+        │       │
+        │       ├─► granularity = FILE (Spark default):
+        │       │     wraps FileScopedPositionDeleteWriter   [core/deletes]
+        │       │       └─► delegates to RollingPositionDeleteWriter
+        │       │           per referenced data file — typically one
+        │       │           delete file per data file, but the rolling
+        │       │           writer may roll over to additional files
+        │       │           when target-file-size is exceeded
+        │       │
+        │       ├─► granularity = PARTITION:
+        │       │     wraps RollingPositionDeleteWriter      [core/io]
+        │       │       └─► PositionDeleteWriter             [core/deletes]
+        │       │       └─► may also roll over to multiple delete files
+        │       │           per (spec, partition) when target-file-size
+        │       │           is exceeded
+        │       │
+        │       └─► tracks referencedDataFiles (CharSequenceSet)
         │
         └─► if input unordered:
               FanoutPositionOnlyDeleteWriter                 [core/io]
-                └─► routes records to per-file PositionDeleteWriter
+                └─► SortingPositionOnlyDeleteWriter          [core/deletes]
+                      └─► sorts by (path, pos), then writes via
+                          RollingPositionDeleteWriter
+                      └─► optional loadPreviousDeletes hook for
+                          merging with prior file-scoped deletes
 
 PositionDeleteWriter                                         [core/deletes/PositionDeleteWriter]
   │
   ├─► for each PositionDelete<R>:
-  │     appender.add(positionDelete)                         write (path, pos) to Parquet
+  │     appender.add(positionDelete)                         write (path, pos) to the
+  │                                                          configured delete file
+  │                                                          format (Parquet, Avro,
+  │                                                          or ORC)
   │     referencedDataFiles.add(positionDelete.path())       track which data files
   │
   └─► close():
         └─► DeleteFile result:
               ├─ content = POSITION_DELETES
               ├─ path = delete file location
-              ├─ format = PARQUET
+              ├─ format = configured delete FileFormat
+              │           (Parquet / Avro / ORC)
               ├─ recordCount = number of deleted positions
               ├─ fileSizeInBytes
               └─ partition
@@ -231,9 +275,13 @@ RollingPositionDeleteWriter                                  [core/io]
 public class PositionDelete<R> implements StructLike {
     private CharSequence path;     // Data file path containing the deleted row
     private long pos;              // 0-based ordinal position within the file
-    private R row;                 // Optional: actual row data (for CDC/changelog)
+    private R row;                 // Deprecated since 1.11.0, removed in 1.12.0
 }
 ```
+
+The canonical setter is `set(CharSequence path, long pos)`. The
+`set(path, pos, row)` and `row()` accessors are deprecated; new code
+must not rely on row data being carried in position delete records.
 
 ### Read Path — How Position Deletes Are Applied
 
@@ -242,8 +290,11 @@ Planning (Driver):
   ManifestGroup.planFiles()
     └─► DeleteFileIndex.forDataFile(seqNum, dataFile)
           │
-          ├─► Find position deletes scoped to this data file's path
-          ├─► Filter by sequence number: delete.seqNum > data.seqNum
+          ├─► Find position deletes / DVs scoped to this data file's path
+          ├─► Sequence number filtering (per kind):
+          │     • Position deletes / DVs: delete.seqNum >= data.seqNum
+          │     • Equality deletes:       delete.seqNum >  data.seqNum
+          │       (via applySequenceNumber = dataSequenceNumber - 1)
           └─► Return DeleteFile[] associated with this data file
 
 Execution (Per-Task on Executors):
@@ -252,7 +303,8 @@ Execution (Per-Task on Executors):
     ├─► 1. Load position deletes:
     │     deleteLoader.loadPositionDeletes(posDeleteFiles, filePath)
     │       │
-    │       ├─► Read position delete Parquet files
+    │       ├─► Read position delete files (Parquet/Avro/ORC,
+    │       │   per write.delete.format.default)
     │       ├─► Filter records where file_path == current data file
     │       └─► Build BitmapPositionDeleteIndex:
     │             RoaringPositionBitmap.set(pos)              for each deleted position
@@ -304,11 +356,18 @@ Equality deletes identify rows to remove by **matching column values**. Instead 
 ### File Format
 
 ```
-Equality Delete File (Parquet):
+Equality Delete File (row-based):
 ┌─────────────────────────────────────────┐
+│  Format: Parquet / Avro / ORC           │  ◄── from write.delete.format.default
+│                                         │      (falls back to data file format)
 │  Schema:                                │
-│    Same as table schema                 │
-│    (all equality field columns present) │
+│    equalityDeleteRowSchema supplied to  │
+│    the writer factory. MUST include the │
+│    equality fields; MAY include extra   │
+│    columns (e.g. for metrics/sorting).  │
+│    Often a projection of the table      │
+│    schema, not necessarily the full     │
+│    schema.                              │
 │                                         │
 │  Metadata:                              │
 │    equalityFieldIds = [3, 7]            │  ◄── field IDs used for matching
@@ -317,9 +376,10 @@ Equality Delete File (Parquet):
 │  Row 1: {id=99, name="Bob"}             │      id=42 AND name="Alice", etc.
 │  ...                                    │
 │                                         │
-│  Additional columns may be present      │
-│  for metrics/bounds (not used for       │
-│  equality matching)                     │
+│  Non-equality columns present in the    │
+│  schema are written but ignored by the  │
+│  equality match (still useful for       │
+│  metrics, sorting, and bounds).         │
 └─────────────────────────────────────────┘
 ```
 
@@ -328,7 +388,7 @@ Equality Delete File (Parquet):
 - **Partition-scoped:** An equality delete file in partition P applies to ALL data files in partition P whose data sequence number is less than the delete's sequence number
 - **No file_path column:** Unlike position deletes, equality deletes do not reference a specific data file
 - **Broad impact:** A single equality delete file can affect many data files — every file in the partition must be checked
-- **Full row stored:** The delete file contains the full row data for the equality columns, not just positions
+- **Stored columns:** The delete file contains values for every column in the configured `equalityDeleteRowSchema`. That schema must at least cover the equality fields, but it is typically a projection of the table schema rather than every table column
 
 ### Write Path
 
@@ -337,17 +397,22 @@ EqualityDeleteWriter                                         [core/deletes/Equal
   │
   ├─► Constructor takes:
   │     int[] equalityFieldIds         which columns determine equality
-  │     FileAppender<T> appender       writes rows to Parquet
+  │     FileAppender<T> appender       writes rows in the configured
+  │                                     delete file format (Parquet,
+  │                                     Avro, or ORC)
   │     Schema eqDeleteRowSchema       schema of the rows being written
   │
   ├─► write(T row):
-  │     appender.add(row)              write full row to Parquet
+  │     appender.add(row)              writes one record per call
+  │                                    in eqDeleteRowSchema (may be a
+  │                                    projection of the table schema)
   │
   └─► close():
         └─► DeleteFile result:
               ├─ content = EQUALITY_DELETES
               ├─ equalityFieldIds = [3, 7, ...]
-              ├─ format = PARQUET
+              ├─ format = configured delete FileFormat
+              │           (Parquet / Avro / ORC)
               ├─ recordCount = number of delete rows
               ├─ metrics (column stats, bounds)
               └─ sortOrderId (if sorted)
@@ -372,7 +437,8 @@ Execution (Per-Task on Executors):
     │     │
     │     ├─► Load all delete rows into StructLikeSet:
     │     │     deleteSet = deleteLoader.loadEqualityDeletes(deleteFiles, deleteSchema)
-    │     │       └─► Read all Parquet delete files
+    │     │       └─► Read all row-based delete files
+    │     │           (Parquet/Avro/ORC)
     │     │           Project to equality columns
     │     │           Add each row to hash set
     │     │
@@ -416,7 +482,7 @@ Actual read projection:
 
 ## 5. Deletion Vectors (V3)
 
-Deletion Vectors (DVs) are the V3 evolution of position deletes. They use a compact **RoaringBitmap** serialized into a **Puffin file** instead of row-by-row Parquet records.
+Deletion Vectors (DVs) are the V3 evolution of position deletes. They use a compact **RoaringBitmap** serialized into a **Puffin file** instead of row-by-row records in a row-based delete file (Parquet/Avro/ORC). In V3 and V4 they are also the *only* allowed encoding for positional deletes — row-based position delete files are rejected at commit time.
 
 ### File Format
 
@@ -459,13 +525,13 @@ Puffin File (deletion-vectors.puffin):
 
 | Aspect         | Position Deletes (V2)                           | Deletion Vectors (V3)                                       |
 |----------------|-------------------------------------------------|-------------------------------------------------------------|
-| File format    | Parquet (row-based)                             | Puffin (binary blob)                                        |
+| File format    | Row-based (Parquet/Avro/ORC, configurable)      | Puffin (binary blob)                                        |
 | Storage        | One record per deleted row                      | Compressed bitmap — orders of magnitude smaller             |
 | Access pattern | Sequential scan of delete file                  | Direct offset/length access to blob                         |
 | Per data file  | Multiple delete files possible                  | At most ONE DV per data file                                |
 | Metadata       | Just `recordCount`                              | `referencedDataFile`, `contentOffset`, `contentSizeInBytes` |
 | Mergeability   | Must read all delete files and union            | Can load bitmap, set new bits, rewrite                      |
-| Loading cost   | Read Parquet, filter by file_path, build bitmap | Read blob at offset, deserialize bitmap directly            |
+| Loading cost   | Read delete file (Parquet/Avro/ORC), filter by file_path, build bitmap | Read blob at offset, deserialize bitmap directly  |
 
 ### Write Path
 
@@ -477,7 +543,7 @@ SparkPositionDeltaWrite.newDeleteWriter()                    [spark/source]
   │
   ├─► context.useDVs() == true   (V3 table)
   │
-  └─► new PartitioningDVWriter(files, previousDeleteLoader)
+  └─► new PartitioningDVWriter(fileFactory, loadPreviousDeletes)
 
 PartitioningDVWriter                                         [core/io]
   │
@@ -485,11 +551,16 @@ PartitioningDVWriter                                         [core/io]
 
 BaseDVFileWriter                                             [core/deletes/BaseDVFileWriter]
   │
+  ├─► Constructor:
+  │     BaseDVFileWriter(
+  │       OutputFileFactory fileFactory,
+  │       Function<String, PositionDeleteIndex> loadPreviousDeletes)
+  │
   ├─► ACCUMULATION PHASE:
   │     │
   │     ├─► delete(String path, long pos, PartitionSpec spec, StructLike partition)
   │     │     │
-  │     │     └─► Map<String, Deletes> dvs:
+  │     │     └─► Map<String, Deletes> deletesByPath:
   │     │           key = data file path
   │     │           value = Deletes {
   │     │             path: data file path,
@@ -500,12 +571,17 @@ BaseDVFileWriter                                             [core/deletes/BaseD
   │     │
   │     └─► positions.delete(pos)                            set bit in bitmap
   │
-  ├─► MERGE WITH PREVIOUS (optional):
+  ├─► MERGE WITH PREVIOUS (on close):
   │     │
-  │     └─► If previous DV exists for this data file:
-  │           previousDeleteLoader.loadPositionDeletes(oldDV, path)
-  │             → oldBitmap
-  │           newBitmap = merge(oldBitmap, currentBitmap)    union of positions
+  │     ├─► For each accumulated path:
+  │     │     previous = loadPreviousDeletes.apply(path)     Function call
+  │     │     if previous != null:
+  │     │       positions.merge(previous)                    union of bitmaps
+  │     │
+  │     └─► For each previous DeleteFile reachable via the index:
+  │           if ContentFileUtil.isFileScoped(previousDeleteFile):
+  │             rewrittenDeleteFiles.add(previousDeleteFile)  ◄── must be replaced
+  │                                                              in the new commit
   │
   └─► CLOSE (write Puffin file):
         │
@@ -538,11 +614,18 @@ BaseDVFileWriter                                             [core/deletes/BaseD
                 .ofPositionDeletes()                         ◄── still POSITION_DELETES content type
                 .withFormat(FileFormat.PUFFIN)
                 .withPath(puffinFilePath)
+                .withFileSizeInBytes(puffinFileSize)
                 .withReferencedDataFile(dataFilePath)        ◄── single data file reference
-                .withContentOffset(blobOffset)               ◄── direct access to blob
-                .withContentSizeInBytes(blobSize)
-                .withRecordCount(bitmap.cardinality())
+                .withContentOffset(blobMetadata.offset())    ◄── direct access to blob
+                .withContentSizeInBytes(blobMetadata.length())
+                .withRecordCount(positions.cardinality())
                 .build()
+
+DeleteWriteResult                                            [core/io]
+  ├─ deleteFiles            new DV DeleteFiles
+  ├─ referencedDataFiles    CharSequenceSet of data file paths
+  └─ rewrittenDeleteFiles   prior file-scoped/DV deletes that the new
+                            commit will remove (see RowDelta.removeDeletes)
 ```
 
 ### Read Path
@@ -561,21 +644,30 @@ Planning (Driver):
             return concat(equalityDeletes, [dv])
 
 Execution (Executors):
-  BaseDeleteLoader.loadPositionDeletes(dvDeleteFile, filePath)
+  BaseDeleteLoader.loadPositionDeletes(deleteFiles, filePath)
     │
-    ├─► Detect DV: deleteFile.referencedDataFile() != null
+    ├─► if ContentFileUtil.containsSingleDV(deleteFiles):
+    │     │
+    │     ├─► validateDV(dv, filePath)
+    │     │     checks contentOffset, contentSizeInBytes,
+    │     │     and that filePath == dv.referencedDataFile()
+    │     │
+    │     ├─► readDV(dv):
+    │     │     IOUtil.readFully(inputFile,
+    │     │                      dv.contentOffset(),
+    │     │                      buf,
+    │     │                      0,
+    │     │                      dv.contentSizeInBytes().intValue())
+    │     │
+    │     └─► PositionDeleteIndex.deserialize(bytes, dv)
+    │           → BitmapPositionDeleteIndex (RoaringPositionBitmap)
     │
-    ├─► Read blob directly from Puffin:
-    │     inputFile.newStream()
-    │       .seek(deleteFile.contentOffset())
-    │       .read(deleteFile.contentSizeInBytes())
-    │
-    ├─► Deserialize:
-    │     BitmapPositionDeleteIndex.deserialize(blobBytes)
-    │       → RoaringPositionBitmap
-    │
-    └─► Same interface as position deletes:
-          positionIndex.isDeleted(pos) → true/false          O(1) per row
+    └─► else (legacy V2 position delete files):
+          getOrReadPosDeletes(deleteFiles, filePath)
+            └─► caches per-file PositionDeleteIndex when beneficial
+
+    Same interface as position deletes:
+      positionIndex.isDeleted(pos) → true/false              O(1) per row
 ```
 
 ### Write Decision Logic
@@ -583,17 +675,40 @@ Execution (Executors):
 ```
 SparkPositionDeltaWrite.newDeleteWriter()                    [spark/source]
   │
-  ├─► if context.useDVs():                                  V3+ table
-  │     └─► PartitioningDVWriter
+  ├─► if context.useDVs():                                   V3+ table
+  │     └─► PartitioningDVWriter(files, previousDeleteLoader)
   │           └─► BaseDVFileWriter → Puffin file
   │
-  ├─► elif inputOrdered && no rewritable deletes:            V2, ordered
-  │     └─► ClusteredPositionDeleteWriter
-  │           └─► PositionDeleteWriter → Parquet file
+  ├─► elif inputOrdered && rewritableDeletes == null:        V2, ordered,
+  │     │                                                    nothing to merge
+  │     └─► ClusteredPositionDeleteWriter(
+  │           writers, files, io, targetFileSize, granularity)
   │
   └─► else:                                                  V2, unordered
-        └─► FanoutPositionOnlyDeleteWriter
-              └─► per-file PositionDeleteWriter → Parquet files
+        │                                                    OR V2, ordered
+        │                                                    with rewritable
+        │                                                    previous deletes
+        └─► FanoutPositionOnlyDeleteWriter(
+              writers, files, io, targetFileSize,
+              granularity, previousDeleteLoader)
+              │
+              ├─► granularity = FILE (Spark default):
+              │     deletes routed per referenced data file via
+              │     RollingPositionDeleteWriter; usually one delete
+              │     file per data file, but rolling may produce
+              │     additional files when target-file-size is exceeded
+              │
+              └─► granularity = PARTITION:
+                    deletes routed per (spec, partition) via
+                    RollingPositionDeleteWriter; usually one delete
+                    file per partition, but rolling may produce
+                    additional files when target-file-size is exceeded
+
+Granularity is controlled by `write.delete.granularity`.
+SparkWriteConf.deleteGranularity() defaults to FILE in all current
+versioned Spark modules (v3.5/v4.0/v4.1), overriding the table-level
+default of PARTITION exposed by TableProperties. Only DVs are
+inherently file-scoped.
 ```
 
 ---
@@ -608,7 +723,12 @@ DataTableScan.planFiles()                                    [core/DataTableScan
   └─► ManifestGroup.planFiles()                              [core/ManifestGroup]
         │
         ├─► Build DeleteFileIndex from all delete manifests:
-        │     DeleteFileIndex.build(table, snapshot)          [core/DeleteFileIndex]
+        │     ManifestGroup constructor:
+        │       deleteIndexBuilder =
+        │         DeleteFileIndex.builderFor(io, deleteManifests)  [core/DeleteFileIndex]
+        │     planFiles():
+        │       DeleteFileIndex deleteFiles =
+        │         deleteIndexBuilder.scanMetrics(scanMetrics).build()
         │       │
         │       ├─► Read all delete manifest files
         │       ├─► Index position deletes by partition
@@ -622,17 +742,29 @@ DataTableScan.planFiles()                                    [core/DataTableScan
               │     entry.dataSequenceNumber(),
               │     entry.file())
               │       │
-              │       ├─► Sequence number filtering:
-              │       │     include delete only if
-              │       │     delete.dataSequenceNumber > data.dataSequenceNumber
+              │       ├─► Sequence number filtering (per delete kind):
+              │       │     • Position deletes / DVs:
+              │       │         delete.dataSequenceNumber >= data.dataSequenceNumber
+              │       │         (same-seq deletes apply; DVs additionally
+              │       │         validated via ValidationException)
+              │       │     • Equality deletes:
+              │       │         delete.dataSequenceNumber > data.dataSequenceNumber
+              │       │         (DeleteFileIndex caches an
+              │       │         applySequenceNumber = dataSequenceNumber - 1)
               │       │
-              │       ├─► For position deletes: match by partition
-              │       ├─► For equality deletes: match by partition + field scope
-              │       ├─► For DVs: match by referencedDataFile path
+              │       ├─► global   = findGlobalDeletes(seq, file)      cross-partition eq deletes
+              │       ├─► eqPart   = findEqPartitionDeletes(seq, file) partition-scoped eq deletes
+              │       ├─► dv       = findDV(seq, file)                 keyed by dataFile.location()
               │       │
               │       └─► DV precedence:
-              │             if DV exists for this file, include it
-              │             (DV is canonical source of positional deletes)
+              │             if dv != null && global == null && eqPart == null:
+              │               return new DeleteFile[]{ dv }
+              │             elif dv != null:
+              │               return concat(global, eqPart, new DeleteFile[]{ dv })
+              │             else:
+              │               posPart = findPosPartitionDeletes(seq, file)
+              │               posPath = findPathDeletes(seq, file)
+              │               return concat(global, eqPart, posPart, posPath)
               │
               └─► yield FileScanTask(
                     file = dataFile,
@@ -646,18 +778,39 @@ DataTableScan.planFiles()                                    [core/DataTableScan
 ```
 Timeline:
 
-  Snapshot 1 (seq=1):  data-file-A added
-  Snapshot 2 (seq=2):  data-file-B added
-  Snapshot 3 (seq=3):  delete-file-X added (deletes from data-file-A)
-  Snapshot 4 (seq=4):  data-file-C added
+  Snapshot 1 (seq=1):  data-file-A and data-file-B added
+                       (same partition P)
+  Snapshot 2 (seq=2):  delete-file-X added
+                       • position delete / DV variant: references
+                         data-file-A only
+                       • equality delete variant: scoped to
+                         partition P, no file_path column
+  Snapshot 3 (seq=3):  data-file-C added (same partition P)
 
-  delete-file-X.dataSequenceNumber = 3
+  delete-file-X.dataSequenceNumber = 2
 
-  Applies to data-file-A?  YES  (3 > 1)
-  Applies to data-file-B?  YES  (3 > 2)
-  Applies to data-file-C?  NO   (3 < 4)  ◄── data added AFTER the delete
+  Position delete / DV (rule: delete.seq >= data.seq AND
+  referenced data file path matches):
+    Applies to data-file-A?  YES  (2 >= 1 AND path matches)
+    Applies to data-file-B?  NO   (2 >= 1 but path does NOT match —
+                                   position deletes/DVs are
+                                   file-scoped via file_path column
+                                   or referencedDataFile())
+    Applies to data-file-C?  NO   (2 < 3)
 
-  This prevents retroactive application of deletes to newer data.
+  Equality delete (rule: delete.seq > data.seq AND same partition):
+    Applies to data-file-A?  YES  (2 > 1)
+    Applies to data-file-B?  YES  (2 > 1)
+    Applies to data-file-C?  NO   (2 < 3, equivalently
+                                   applySeq=1 < 3)
+
+  Same-sequence behavior differs by kind. If data-file-C and
+  delete-file-X were both committed at seq=2 in the same RowDelta:
+    • a position delete / DV with seq=2 still applies to its
+      referenced data file (e.g. data-file-A) at seq=1
+    • an equality delete with seq=2 does NOT apply to data-file-C
+      at seq=2 (applySequenceNumber = 1 < 2), so newly inserted rows
+      in the same commit are not retroactively masked.
 ```
 
 ### Execution Phase (Executors)
@@ -675,8 +828,9 @@ DeleteFilter.filter(CloseableIterable<T> records)            [data/DeleteFilter]
   │       │     PositionDeleteIndex posIndex = deletedRowPositions()
   │       │       └─► deleteLoader.loadPositionDeletes(posDeletes, filePath)
   │       │             │
-  │       │             ├─► For Parquet position deletes:
-  │       │             │     Read Parquet file
+  │       │             ├─► For row-based position deletes
+  │       │             │   (Parquet/Avro/ORC):
+  │       │             │     Read the delete file
   │       │             │     Filter: file_path == current data file path
   │       │             │     For each (file_path, pos): bitmap.set(pos)
   │       │             │
@@ -721,11 +875,19 @@ DeleteFilter.filter(CloseableIterable<T> records)            [data/DeleteFilter]
 │               │  (write.*.mode=cow)    │  (write.*.mode=mor)                     │
 ├───────────────┼────────────────────────┼─────────────────────────────────────────┤
 │               │                        │                                         │
-│  DELETE       │  Rewrite data files    │  V2: Position delete files (Parquet)    │
-│  FROM ...     │  without deleted rows  │  V3: Deletion vectors (Puffin)          │
-│  WHERE ...    │                        │                                         │
-│               │  API: OverwriteFiles   │  API: RowDelta.addDeletes()             │
-│               │  Snapshot op: replace  │  Snapshot op: overwrite                 │
+│  DELETE       │  Rewrite data files    │  V2: Row-based position delete files    │
+│  FROM ...     │  without deleted rows  │      (Parquet/Avro/ORC)                 │
+│  WHERE ...    │                        │  V3+: Deletion vectors (Puffin); V3/V4  │
+│               │                        │      forbid row-based position deletes  │
+│               │  API: OverwriteFiles   │  API: RowDelta.addDeletes() and may     │
+│               │                        │       removeDeletes(prior file-scoped   │
+│               │                        │       /DV deletes that were merged in)  │
+│               │  Snapshot op: overwrite│  Snapshot op: delete (no data files are │
+│               │                        │      added; BaseRowDelta.operation()    │
+│               │                        │      returns DELETE whenever delete     │
+│               │                        │      files are added and no data files  │
+│               │                        │      are added, regardless of removed   │
+│               │                        │      delete files)                      │
 │               │                        │                                         │
 ├───────────────┼────────────────────────┼─────────────────────────────────────────┤
 │               │                        │                                         │
@@ -736,6 +898,7 @@ DeleteFilter.filter(CloseableIterable<T> records)            [data/DeleteFilter]
 │               │   within same file)    │                                         │
 │               │                        │  API: RowDelta.addDeletes() +           │
 │               │  API: OverwriteFiles   │       RowDelta.addRows()                │
+│               │                        │  Snapshot op: overwrite                 │
 │               │                        │                                         │
 ├───────────────┼────────────────────────┼─────────────────────────────────────────┤
 │               │                        │                                         │
@@ -745,7 +908,9 @@ DeleteFilter.filter(CloseableIterable<T> records)            [data/DeleteFilter]
 │  WHEN NOT     │    inserted rows       │    rows                                 │
 │  MATCHED      │                        │                                         │
 │               │  API: OverwriteFiles   │  API: RowDelta                          │
-│               │  + AppendFiles         │                                         │
+│               │  (single op: removed   │  Snapshot op: append, delete, or        │
+│               │   files + replacement  │    overwrite depending on what changed  │
+│               │   + inserts together)  │                                         │
 │               │                        │                                         │
 ├───────────────┼────────────────────────┼─────────────────────────────────────────┤
 │               │                        │                                         │
@@ -755,6 +920,15 @@ DeleteFilter.filter(CloseableIterable<T> records)            [data/DeleteFilter]
 │               │  API: AppendFiles      │  API: AppendFiles                       │
 │               │                        │                                         │
 └───────────────┴────────────────────────┴─────────────────────────────────────────┘
+
+BaseRowDelta.operation() picks the snapshot operation from what was
+added, not from what was removed:
+  • APPEND    — adds data files only, no delete files added,
+                no data files removed
+  • DELETE    — adds delete files and no data files; the value of
+                "delete files removed" does NOT affect this branch
+  • OVERWRITE — every other mix (data files added, or data files
+                removed together with delete additions, etc.)
 ```
 
 ### MoR: How UPDATE Works as Delete + Insert
@@ -795,18 +969,28 @@ RowDelta API                                                 [api/RowDelta]
   ├─► addDeletes(DeleteFile deletes)
   │     Add position delete files, equality delete files, or DVs
   │
-  ├─► removeRows(DataFile file)
+  ├─► removeRows(DataFile file)               (default: UnsupportedOperationException)
   │     Remove a data file (for rewrite operations)
   │
-  ├─► removeDeletes(DeleteFile deletes)
+  ├─► removeDeletes(DeleteFile deletes)       (default: UnsupportedOperationException)
   │     Remove old delete files (when rewriting/merging DVs)
   │
   ├─► validateFromSnapshot(long snapshotId)
   │     Set the baseline snapshot for conflict detection
   │
-  ├─► validateDataFilesExist(Iterable<CharSequence> referencedFiles)
+  ├─► caseSensitive(boolean caseSensitive)
+  │     Control case sensitivity for expression binding during validation
+  │
+  ├─► validateDataFilesExist(Iterable<? extends CharSequence> referencedFiles)
   │     Ensure data files referenced by position deletes still exist
   │     (prevents dangling delete references)
+  │
+  ├─► validateDeletedFiles()
+  │     Also validate that referenced data files were not removed by a
+  │     concurrent delete operation (needed for read-and-reappend flows)
+  │
+  ├─► conflictDetectionFilter(Expression filter)
+  │     Restrict conflict checks to rows matching this expression
   │
   ├─► validateNoConflictingDataFiles()
   │     Detect concurrent data modifications (serializable isolation)
@@ -816,21 +1000,57 @@ RowDelta API                                                 [api/RowDelta]
   │     (required for UPDATE and MERGE to prevent lost updates)
   │
   └─► commit()
-        └─► BaseRowDelta (MergingSnapshotProducer)           [core/BaseRowDelta]
+        └─► BaseRowDelta extends MergingSnapshotProducer     [core/BaseRowDelta]
               │
-              ├─► Validate all constraints
+              ├─► validate(base, parent):
+              │     • startingSnapshotId is ancestor check
+              │     • validateDataFilesExist for referenced paths
+              │     • failMissingDeletePaths (if validateDeletedFiles)
+              │     • validateAddedDataFiles (if validateNoConflictingDataFiles)
+              │     • validateNoNewDeletesForDataFiles + validateNoNewDeleteFiles
+              │       (if validateNoConflictingDeleteFiles)
+              │     • validateNoConflictingFileAndPositionDeletes
+              │       (blocks removing a data file that a new DV/position
+              │        delete still references)
+              │     • validateAddedDVs (V3 — at most one DV per data file)
+              │
               ├─► Write new manifest with added/removed files
               ├─► Write manifest list
-              ├─► Create snapshot (operation = "overwrite")
+              ├─► operation() ∈ { APPEND, DELETE, OVERWRITE }
               └─► TableOperations.commit() → atomic CAS
 ```
 
 ### Isolation Levels
 
-| Level          | Behavior                                                                                    | Use Case                                                              |
-|----------------|---------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
-| `serializable` | Validates no concurrent data OR delete changes in affected partitions. Retries on conflict. | Safe default for correctness                                          |
-| `snapshot`     | Only validates no concurrent delete changes. Allows concurrent inserts.                     | Higher throughput when concurrent inserts are expected and acceptable |
+Spark's commit logic in `SparkPositionDeltaWrite` composes the
+`RowDelta` validations from three signals: whether a scan ran, the
+command kind (DELETE vs UPDATE/MERGE), and the configured isolation
+level.
+
+| Validation step                       | Applied when                                              |
+|---------------------------------------|-----------------------------------------------------------|
+| `validateDataFilesExist(referenced)`  | Always, when a scan ran                                   |
+| `validateFromSnapshot(scanSnapshotId)`| Always, when the scan has a snapshot id                   |
+| `conflictDetectionFilter(scanFilter)` | Always, when a scan ran                                   |
+| `validateDeletedFiles()`              | `command == UPDATE` or `command == MERGE` only            |
+| `validateNoConflictingDeleteFiles()`  | `command == UPDATE` or `command == MERGE` only            |
+| `validateNoConflictingDataFiles()`    | `isolationLevel == SERIALIZABLE` only                     |
+
+Implications:
+
+- DELETE keeps the same set of validations under both isolation
+  levels except for the data-file conflict check: it is added only for
+  `serializable`.
+- UPDATE and MERGE always validate concurrent delete-file additions
+  regardless of isolation level, because un-deleting a row that was
+  read-and-rewritten would silently corrupt the result.
+- If the optimizer eliminates the scan (e.g. empty relation), no
+  validations are added — the commit is independent of the table state.
+
+| Level          | Behavior                                                                                       | Use Case                                                              |
+|----------------|------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `serializable` | All of the above PLUS `validateNoConflictingDataFiles()` — rejects concurrently appended rows. | Safe default for correctness                                          |
+| `snapshot`     | Drops `validateNoConflictingDataFiles()`; concurrently appended rows are allowed.              | Higher throughput when concurrent inserts are expected and acceptable |
 
 ---
 
@@ -849,20 +1069,64 @@ RewriteDataFiles (compaction)
   ├─► Write new data files (without deleted rows)
   │
   └─► Commit: RewriteFiles
-        .deleteFile(old data file)
-        .deleteFile(old delete file)      ◄── delete files removed too
+        .deleteFile(old data file)        ◄── rewritten data files removed
+        .deleteFile(old DV)               ◄── dangling DVs explicitly removed
+                                              by the compaction layer
+                                              (RewriteFileGroup.danglingDVs()
+                                              filters task.deletes() by
+                                              ContentFileUtil::isDV)
         .addFile(new data file)           ◄── clean file, no pending deletes
         .commit()
+              │
+              └─► MergingSnapshotProducer.apply (generic, runs for every
+                  commit type — not specific to compaction):
+                    ├─► filterManager.filterManifests(...)
+                    │     rewrites DATA manifests only (drops data
+                    │     file entries explicitly removed by this
+                    │     commit). Does not touch delete manifests
+                    ├─► deleteFilterManager.dropDeleteFilesOlderThan(
+                    │       minDataSequenceNumber)
+                    │     applies to every kind of delete file (DVs,
+                    │     row-based position deletes, equality
+                    │     deletes): drops entries whose
+                    │     dataSequenceNumber < minDataSequenceNumber,
+                    │     since they cannot match any live row
+                    └─► deleteFilterManager.removeDanglingDeletesFor(
+                          filesToBeDeleted)
+                          only drops DVs whose referencedDataFile is in
+                          the removed set (ManifestFilterManager.
+                          isDanglingDV gates this with
+                          ContentFileUtil.isDV). Row-based position
+                          deletes and equality deletes that referenced
+                          a removed data file are NOT pruned here
 
-Result: delete files consumed and removed, data files compacted
+Result: rewritten data files are replaced; dangling DVs attached to
+them are dropped both by the compaction layer (RewriteFileGroup.
+danglingDVs()) and by the generic isDanglingDV cleanup. The generic
+dropDeleteFilesOlderThan path additionally evicts any delete file
+(including row-based) whose sequence number is below the minimum live
+data sequence number. Row-based position deletes and equality deletes
+that still apply to surviving data files — or that became dangling
+without crossing the sequence-number boundary — remain in the new
+snapshot until they are explicitly rewritten or cleaned up.
 ```
+
+Row-based dangling cleanup is handled by explicit maintenance paths,
+not by the generic commit cleanup. Opt in with `remove-dangling-deletes`
+(defaults to `false`) on `RewriteDataFiles` or run
+`RewritePositionDeleteFiles` to compact and prune the position delete
+files themselves.
 
 ### Compaction Triggers Based on Deletes
 
-| Property                 | Default   | Purpose                                            |
-|--------------------------|-----------|----------------------------------------------------|
-| `delete-file-threshold`  | `MAX_INT` | Rewrite data files associated with N+ delete files |
-| `delete-ratio-threshold` | `0.3`     | Rewrite data files where 30%+ of rows are deleted  |
+Defined in `BinPackRewriteFilePlanner` ([core/actions]) and passed as
+`options` to `rewrite_data_files`:
+
+| Property                 | Default          | Purpose                                            |
+|--------------------------|------------------|----------------------------------------------------|
+| `delete-file-threshold`  | `Integer.MAX_VALUE` | Rewrite data files associated with N+ delete files (disabled by default) |
+| `delete-ratio-threshold` | `0.3`            | Rewrite data files where ≥30% of rows are deleted  |
+| `max-files-to-rewrite`   | (unset)          | Cap the number of files rewritten in one planning pass |
 
 Example:
 ```sql
@@ -886,16 +1150,34 @@ Time ─────────────────────────
 2. DELETE WHERE id=99 (MoR)
    → delete-file-002 created (references data-file-A)
 
-3. Compaction runs:
+3. Compaction runs (RewriteDataFiles):
    → Read data-file-A, apply delete-file-001 + delete-file-002
    → Write data-file-B (clean, no deleted rows)
-   → Commit: remove data-file-A + delete-file-{001,002}, add data-file-B
+   → Commit: remove data-file-A, add data-file-B
+     • DVs attached to data-file-A are dropped both by the compaction
+       layer (RewriteFileGroup.danglingDVs() filters task.deletes()
+       by ContentFileUtil::isDV) and by the generic isDanglingDV path
+       in deleteFilterManager.removeDanglingDeletesFor(...)
+     • dropDeleteFilesOlderThan(minSeq) additionally removes any
+       delete file (DV, row-based position, equality) whose sequence
+       number falls below the new minimum live data sequence number
+     • Row-based position deletes and equality deletes that still
+       apply to surviving data files — or that became dangling
+       without crossing the sequence-number boundary — remain in the
+       snapshot. The generic cleanup does NOT prune them; explicit
+       maintenance (`remove-dangling-deletes` or
+       `RewritePositionDeleteFiles`) is required
 
-4. ExpireSnapshots:
+4. (optional) Proactive dangling delete cleanup:
+   → re-run RewriteDataFiles with `remove-dangling-deletes=true`, OR
+   → run RewritePositionDeleteFiles to compact away dangling positions
+   → Commit drops delete-file-{001,002} from the live snapshot
+
+5. ExpireSnapshots:
    → Old snapshots referencing delete-file-{001,002} expired
    → Files now orphaned (no snapshot references them)
 
-5. RemoveOrphanFiles (or GC):
+6. RemoveOrphanFiles (or GC):
    → delete-file-{001,002} physically deleted from storage
 ```
 
@@ -913,41 +1195,50 @@ Time ─────────────────────────
 
 ## 10. Key Classes Reference
 
-| Area                        | Class                            | Module       | Key Method                                                          |
-|-----------------------------|----------------------------------|--------------|---------------------------------------------------------------------|
-| **Delete types**            | `DeleteFile`                     | api          | Interface for all delete files                                      |
-|                             | `FileContent`                    | api          | Enum: `DATA`, `POSITION_DELETES`, `EQUALITY_DELETES`                |
-|                             | `PositionDelete<R>`              | core/deletes | `set(path, pos)`, `set(path, pos, row)`                             |
-| **Position delete writing** | `PositionDeleteWriter`           | core/deletes | `write(PositionDelete)`, `close()`                                  |
-|                             | `RollingPositionDeleteWriter`    | core/io      | Splits large delete files by size                                   |
-|                             | `ClusteredPositionDeleteWriter`  | core/io      | Assumes ordered input                                               |
-|                             | `FanoutPositionOnlyDeleteWriter` | core/io      | Per-file fanout routing                                             |
-| **Equality delete writing** | `EqualityDeleteWriter`           | core/deletes | `write(T row)`, `close()`                                           |
-|                             | `RollingEqualityDeleteWriter`    | core/io      | Splits large equality delete files                                  |
-| **Deletion vector writing** | `DVFileWriter`                   | core/deletes | Interface for DV writers                                            |
-|                             | `BaseDVFileWriter`               | core/deletes | `delete(path, pos, spec, partition)`, `close()`                     |
-|                             | `PartitioningDVWriter`           | core/io      | Partitioned DV output                                               |
-|                             | `PuffinWriter`                   | core/puffin  | Binary blob file format                                             |
-| **Bitmap index**            | `PositionDeleteIndex`            | core/deletes | Interface: `isDeleted(long pos)`                                    |
-|                             | `BitmapPositionDeleteIndex`      | core/deletes | RoaringBitmap implementation                                        |
-|                             | `RoaringPositionBitmap`          | core/deletes | 64-bit Roaring bitmap                                               |
-| **Delete filter (reads)**   | `DeleteFilter`                   | data         | `filter()`, `applyPosDeletes()`, `applyEqDeletes()`                 |
-|                             | `BaseDeleteLoader`               | data         | `loadPositionDeletes()`, `loadEqualityDeletes()`                    |
-|                             | `DeleteFileIndex`                | core         | `forDataFile()` — associates deletes with data files                |
-|                             | `Deletes`                        | core/deletes | Utility: `filterDeleted()`, `markDeleted()`                         |
-| **Spark delete reads**      | `PositionDeletesRowReader`       | spark/source | Reads position delete files as data                                 |
-|                             | `EqualityDeleteRowReader`        | spark/source | Reads equality delete files as data                                 |
-|                             | `DVIterator`                     | spark/source | Extracts positions from Puffin DV blobs                             |
-| **Spark MoR write**         | `SparkPositionDeltaOperation`    | spark/source | MoR entry point                                                     |
-|                             | `SparkPositionDeltaWrite`        | spark/source | MoR write orchestration                                             |
-|                             | `BaseDeltaWriter`                | spark/source | Base class for MoR task writers                                     |
-|                             | `DeleteOnlyDeltaWriter`          | spark/source | DELETE-only MoR writer                                              |
-|                             | `UnpartitionedDeltaWriter`       | spark/source | UPDATE/MERGE unpartitioned                                          |
-|                             | `PartitionedDeltaWriter`         | spark/source | UPDATE/MERGE partitioned                                            |
-| **Spark CoW write**         | `SparkCopyOnWriteOperation`      | spark/source | CoW entry point                                                     |
-| **Mode selection**          | `SparkRowLevelOperationBuilder`  | spark/source | CoW vs MoR decision                                                 |
-|                             | `RowLevelOperationMode`          | core         | Enum: `COPY_ON_WRITE`, `MERGE_ON_READ`                              |
-| **Commit API**              | `RowDelta`                       | api          | `addRows()`, `addDeletes()`, `commit()`                             |
-|                             | `BaseRowDelta`                   | core         | Implementation of RowDelta                                          |
-| **Configuration**           | `TableProperties`                | core         | `DELETE_MODE`, `UPDATE_MODE`, `MERGE_MODE`, etc.                    |
-| **Metadata**                | `MetadataColumns`                | core         | `DELETE_FILE_PATH`, `DELETE_FILE_POS`, `ROW_POSITION`, `IS_DELETED` |
+Spark classes live under the versioned Spark module
+(`spark/v3.5/`, `spark/v4.0/`, `spark/v4.1/`); "spark/source" below
+refers to that subtree of any version.
+
+| Area                        | Class                            | Module       | Key Method / Note                                                     |
+|-----------------------------|----------------------------------|--------------|-----------------------------------------------------------------------|
+| **Delete types**            | `DeleteFile`                     | api          | Interface for all delete files; `referencedDataFile()`, `contentOffset()`, `contentSizeInBytes()` |
+|                             | `FileContent`                    | api          | Enum: `DATA`, `POSITION_DELETES`, `EQUALITY_DELETES`, `DATA_MANIFEST`, `DELETE_MANIFEST` |
+|                             | `PositionDelete<R>`              | core/deletes | `set(path, pos)` is canonical; `set(path, pos, row)` and `row()` deprecated in 1.11.0 |
+| **Position delete writing** | `PositionDeleteWriter`           | core/deletes | `write(PositionDelete)`, `close()`                                    |
+|                             | `RollingPositionDeleteWriter`    | core/io      | Splits large delete files by size                                     |
+|                             | `ClusteredPositionDeleteWriter`  | core/io      | Assumes ordered input; granularity FILE or PARTITION                  |
+|                             | `FanoutPositionOnlyDeleteWriter` | core/io      | Unordered input; optional `loadPreviousDeletes`                       |
+|                             | `SortingPositionOnlyDeleteWriter`| core/deletes | Sorts positions per file before flushing                              |
+|                             | `FileScopedPositionDeleteWriter` | core/deletes | Routes incoming deletes per referenced data file to its rolling delegate (target-size rolling can still split into multiple files) |
+|                             | `DeleteGranularity`              | core/deletes | Enum: `FILE`, `PARTITION` — controls writer fan-out                   |
+| **Equality delete writing** | `EqualityDeleteWriter`           | core/deletes | `write(T row)`, `close()`                                             |
+|                             | `RollingEqualityDeleteWriter`    | core/io      | Splits large equality delete files                                    |
+| **Deletion vector writing** | `DVFileWriter`                   | core/deletes | Interface: `delete(path, pos, spec, partition)`, `delete(path, index, spec, partition)` |
+|                             | `BaseDVFileWriter`               | core/deletes | Constructor takes `Function<String, PositionDeleteIndex>` for previous deletes |
+|                             | `PartitioningDVWriter`           | core/io      | Routes `PositionDelete` records to `BaseDVFileWriter`                 |
+|                             | `PuffinWriter`                   | core/puffin  | Binary blob file format; `location()`, `fileSize()`                   |
+|                             | `StandardBlobTypes.DV_V1`        | core/puffin  | Blob type id: `"deletion-vector-v1"`                                  |
+| **Bitmap index**            | `PositionDeleteIndex`            | core/deletes | Interface: `delete(pos)`, `merge(other)`, `isDeleted(pos)`, `deleteFiles()` |
+|                             | `BitmapPositionDeleteIndex`      | core/deletes | RoaringBitmap implementation                                          |
+|                             | `RoaringPositionBitmap`          | core/deletes | 64-bit positions; portable Roaring serialization                       |
+| **Delete filter (reads)**   | `DeleteFilter`                   | data         | `filter()` = `applyEqDeletes(applyPosDeletes(records))`; also `deletedRowPositions()`, `eqDeletedRowFilter()`, `findEqualityDeleteRows()` |
+|                             | `BaseDeleteLoader`               | data         | `loadPositionDeletes(files, filePath)`, `loadEqualityDeletes(files, schema)`; detects DVs via `ContentFileUtil.containsSingleDV` |
+|                             | `DeleteFileIndex`                | core         | `forDataFile(seq, file)` / `forEntry(entry)` — DV takes precedence    |
+|                             | `Deletes`                        | core/deletes | Utility: `filterDeleted()`, `markDeleted()`, `toPositionIndex(es)`    |
+| **Spark delete reads**      | `PositionDeletesRowReader`       | spark/source | Reads position delete files as data                                   |
+|                             | `EqualityDeleteRowReader`        | spark/source | Reads equality delete files as data                                   |
+|                             | `DVIterator`                     | spark/source | Extracts positions from Puffin DV blobs                               |
+| **Spark MoR write**         | `SparkPositionDeltaOperation`    | spark/source | MoR entry point                                                       |
+|                             | `SparkPositionDeltaWrite`        | spark/source | MoR write orchestration                                               |
+|                             | `BaseDeltaWriter`                | spark/source | Base class for MoR task writers                                       |
+|                             | `DeleteOnlyDeltaWriter`          | spark/source | DELETE-only MoR writer                                                |
+|                             | `UnpartitionedDeltaWriter`       | spark/source | UPDATE/MERGE unpartitioned                                            |
+|                             | `PartitionedDeltaWriter`         | spark/source | UPDATE/MERGE partitioned                                              |
+| **Spark CoW write**         | `SparkCopyOnWriteOperation`      | spark/source | CoW entry point                                                       |
+| **Mode selection**          | `SparkRowLevelOperationBuilder`  | spark/source | CoW vs MoR decision                                                   |
+|                             | `RowLevelOperationMode`          | core         | Enum: `COPY_ON_WRITE("copy-on-write")`, `MERGE_ON_READ("merge-on-read")` |
+| **Commit API**              | `RowDelta`                       | api          | `addRows`, `addDeletes`, `removeRows`, `removeDeletes`, `validate*`, `caseSensitive`, `conflictDetectionFilter` |
+|                             | `BaseRowDelta`                   | core         | Extends `MergingSnapshotProducer`; `operation()` → APPEND/DELETE/OVERWRITE |
+| **Configuration**           | `TableProperties`                | core         | `DELETE_MODE`, `UPDATE_MODE`, `MERGE_MODE`, isolation-level keys, `DELETE_GRANULARITY` |
+|                             | `BinPackRewriteFilePlanner`      | core/actions | `DELETE_FILE_THRESHOLD`, `DELETE_RATIO_THRESHOLD`, `MAX_FILES_TO_REWRITE` |
+| **Metadata**                | `MetadataColumns`                | core         | `DELETE_FILE_PATH`, `DELETE_FILE_POS`, `ROW_POSITION`, `IS_DELETED`, `CONTENT_OFFSET_COLUMN_ID`, `CONTENT_SIZE_IN_BYTES_COLUMN_ID` |
