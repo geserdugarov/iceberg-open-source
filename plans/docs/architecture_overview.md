@@ -41,9 +41,10 @@ This document provides a high-level architecture overview of Apache Iceberg, exc
 │                   ICEBERG CORE (core/)                             │
 │                                                                    │
 │   TableMetadata, BaseTable, BaseTableScan, ManifestGroup           │
-│   SnapshotProducer, FastAppend, MergeAppend, BaseRewriteFiles      │
-│   ManifestReader, ManifestWriter, ManifestListWriter               │
-│   TableMetadataParser, SchemaParser                                │
+│   SnapshotProducer, MergingSnapshotProducer                        │
+│   FastAppend, MergeAppend, BaseRewriteFiles, BaseRowDelta          │
+│   ManifestReader, ManifestWriter, ManifestListWriter, ManifestFiles│
+│   TableMetadataParser, SchemaParser, MetadataUpdateParser          │
 │                                                                    │
 └────────────┬───────────────────┬───────────────────┬───────────────┘
              │                   │                   │
@@ -51,14 +52,14 @@ This document provides a high-level architecture overview of Apache Iceberg, exc
 │ FILE FORMATS     │  │ DATA MODULE       │  │ COMMON UTILITIES     │
 │                  │  │ (data/)           │  │ (common/)            │
 │ ┌─────────────┐  │  │                   │  │                      │
-│ │ parquet/    │  │  │ GenericReader     │  │ Shared utilities     │
-│ │ Parquet.java│  │  │ GenericWriter     │  │ across modules       │
-│ │ ParquetRdr  │  │  │ BaseFileWriter-   │  │                      │
-│ │ ParquetWtr  │  │  │   Factory         │  │                      │
-│ ├─────────────┤  │  │                   │  │                      │
-│ │ orc/        │  │  │                   │  │                      │
-│ ├─────────────┤  │  │                   │  │                      │
-│ │ arrow/      │  │  │                   │  │                      │
+│ │ parquet/    │  │  │ IcebergGenerics   │  │ Shared utilities     │
+│ │ Parquet.java│  │  │ GenericReader     │  │ across modules       │
+│ │ ParquetRdr  │  │  │ GenericAppender-  │  │ (DynClasses,         │
+│ │ ParquetWtr  │  │  │   Factory         │  │  DynMethods, etc.)   │
+│ ├─────────────┤  │  │ GenericFileWriter-│  │                      │
+│ │ orc/        │  │  │   Factory         │  │                      │
+│ ├─────────────┤  │  │ DeleteFilter /    │  │                      │
+│ │ arrow/      │  │  │ BaseDeleteLoader  │  │                      │
 │ └─────────────┘  │  │                   │  │                      │
 └──────────────────┘  └───────────────────┘  └──────────────────────┘
              │
@@ -87,16 +88,20 @@ This document provides a high-level architecture overview of Apache Iceberg, exc
 ```
 iceberg/
 ├── api/                    Public API interfaces and contracts
-├── core/                   Reference implementation of the API
+├── core/                   Reference implementation (incl. avro, rest,
+│                           jdbc, hadoop, view, puffin, encryption)
 ├── common/                 Shared utilities across modules
+├── bom/                    Maven BOM for downstream dependency management
+├── bundled-guava/          Shaded Guava used by every module
 │
 ├── parquet/                Parquet file format reader/writer
 ├── orc/                    ORC file format support
-├── arrow/                  Apache Arrow columnar format integration
-├── data/                   Direct JVM data read/write, BaseFileWriterFactory
+├── arrow/                  Apache Arrow columnar (vectorized) integration
+├── data/                   Generic JVM read/write — Records, DeleteFilter,
+│                           BaseDeleteLoader, *FileWriterFactory
 │
 ├── spark/                  Spark DataSourceV2 integration
-│   ├── v3.5/               (primary development target)
+│   ├── v3.5/               (spark, spark-extensions, spark-runtime)
 │   ├── v4.0/
 │   └── v4.1/
 │
@@ -105,25 +110,32 @@ iceberg/
 │   ├── v2.0/
 │   └── v2.1/
 │
-├── mr/                     Hadoop MapReduce InputFormat
-├── hive-metastore/         Hive metastore Thrift client
+├── mr/                     Hadoop MapReduce InputFormat (also used by Hive)
+├── hive-metastore/         HiveCatalog (Thrift client to Hive Metastore)
 │
-├── aws/                    S3 / Glue catalog integration
-├── azure/                  ADLS integration
-├── gcp/                    GCS integration
+├── aws/                    S3FileIO, GlueCatalog, DynamoDbCatalog, KMS
+├── aws-bundle/             Shaded AWS runtime
+├── azure/                  ADLSFileIO (Gen2)
+├── azure-bundle/           Shaded Azure runtime
+├── gcp/                    GCSFileIO, GCP utilities
+├── gcp-bundle/             Shaded GCP runtime
 ├── aliyun/                 Alibaba Cloud OSS integration
-├── dell/                   Dell ECS integration
+├── dell/                   Dell ECS catalog + FileIO
 │
-├── bigquery/               BigQuery catalog integration
-├── snowflake/              Snowflake catalog integration
-├── nessie/                 Nessie catalog integration
-├── delta-lake/             Delta Lake interop
+├── bigquery/               BigQuery Metastore catalog integration
+├── snowflake/              SnowflakeCatalog (read-only)
+├── nessie/                 NessieCatalog (versioned branches/tags)
+├── delta-lake/             Delta Lake → Iceberg migration helpers
 │
-├── kafka-connect/          Kafka Connect integration
-├── open-api/               REST catalog OpenAPI spec
+├── kafka-connect/          Kafka Connect sink (kafka-connect,
+│                           kafka-connect-runtime, kafka-connect-events,
+│                           kafka-connect-transforms)
+├── open-api/               REST catalog OpenAPI spec + conformance tests
 │
-├── format/                 Iceberg format specification
-└── docs/                   Documentation site
+├── format/                 Iceberg format specification (spec.md, view-spec,
+│                           puffin-spec, udf-spec, gcm-stream-spec)
+├── docs/                   Versioned MkDocs documentation
+└── site/                   Top-level docs site (built with MkDocs)
 ```
 
 ---
@@ -132,17 +144,23 @@ iceberg/
 
 ```
                     ┌─────────────────────────┐
-                    │   metadata.json (v3)    │
-                    │                         │
-                    │  format-version: 2      │
-                    │  table-uuid             │
-                    │  location               │
+                    │   metadata.json         │   (default v2, supported up
+                    │                         │    to v4 — see TableMetadata
+                    │  format-version         │    DEFAULT_TABLE_FORMAT_VERSION
+                    │  table-uuid             │    and SUPPORTED_TABLE_FORMAT_-
+                    │  location               │    VERSION)
+                    │  last-sequence-number   │
+                    │  next-row-id (v3+)      │
                     │  schemas[]              │
                     │  partition-specs[]      │
                     │  sort-orders[]          │
                     │  current-snapshot-id ───┼──┐
                     │  snapshots[] ───────────┼──┤
+                    │  refs{} (branches/tags) │  │
+                    │  statistics[] /         │  │
+                    │  partition-statistics[] │  │
                     │  properties{}           │  │
+                    │  metadata-log[]         │  │
                     └─────────────────────────┘  │
                                                  │
                     ┌────────────────────────────┘
@@ -156,15 +174,17 @@ iceberg/
             │  timestamp-ms     │
             │  operation        │
             │  summary{}        │
+            │  first-row-id     │   (v3+, row lineage)
+            │  added-rows       │   (v3+, row lineage)
             │  manifest-list ───┼──┐
             └───────────────────┘  │
                                    │
                     ┌──────────────┘
                     ▼
           ┌──────────────────────┐
-          │  Manifest List       │    (Avro file: snap-<id>-<attempt>.avro)
-          │                      │
-          │  ┌────────────────┐  │
+          │  Manifest List       │    Avro file: snap-<snapshotId>-
+          │                      │    <attempt>-<commitUUID>.avro (see
+          │  ┌────────────────┐  │    SnapshotProducer.manifestListPath)
           │  │ ManifestFile 1 ├──┼──┐
           │  ├────────────────┤  │  │
           │  │ ManifestFile 2 │  │  │   Each entry contains:
@@ -173,35 +193,48 @@ iceberg/
           │  └────────────────┘  │  │   - added/existing/deleted counts
           └──────────────────────┘  │   - partition field summaries
                                     │     (min/max for partition pruning)
+                                    │   - first-row-id (v3+, assigned by
+                                    │     ManifestListWriter for DATA
+                                    │     manifests)
                     ┌───────────────┘
                     ▼
           ┌──────────────────────┐
-          │  Manifest File       │    (Avro file: <uuid>-m<N>.avro)
-          │                      │
-          │  ┌────────────────┐  │
-          │  │ ManifestEntry 1├──┼──┐
-          │  ├────────────────┤  │  │
-          │  │ ManifestEntry 2│  │  │   Each entry contains:
-          │  ├────────────────┤  │  │   - status (ADDED/EXISTING/DELETED)
-          │  │ ManifestEntry N│  │  │   - snapshot-id
-          │  └────────────────┘  │  │   - data-file reference
-          └──────────────────────┘  │
+          │  Manifest File       │    <uuid>-m<N>.<ext>
+          │                      │    Avro by default; Parquet from v4
+          │  ┌────────────────┐  │    (TableMetadata.MIN_FORMAT_VERSION_-
+          │  │ ManifestEntry 1├──┼──┐ PARQUET_MANIFESTS — selected in
+          │  ├────────────────┤  │  │ SnapshotProducer).
+          │  │ ManifestEntry 2│  │  │
+          │  ├────────────────┤  │  │ Each entry contains:
+          │  │ ManifestEntry N│  │  │ - status (ADDED/EXISTING/DELETED)
+          │  └────────────────┘  │  │ - snapshot-id
+          └──────────────────────┘  │ - content-file reference (DataFile
+                                    │   or DeleteFile; manifest content
+                                    │   = DATA or DELETES)
                                     │
                     ┌───────────────┘
                     ▼
           ┌──────────────────────┐
-          │  DataFile            │
+          │  ContentFile         │    (DataFile, DeleteFile)
           │                      │
-          │  file-path           │    Actual data files:
+          │  file-path           │    Actual data / delete files:
           │  file-format         │    - Parquet (.parquet)
-          │  partition           │    - ORC (.orc)
-          │  record-count        │    - Avro (.avro)
-          │  file-size-bytes     │
-          │  column-sizes{}      │    Per-column stats:
-          │  value-counts{}      │    - null counts
-          │  null-value-counts{} │    - lower/upper bounds
-          │  lower-bounds{}      │    - NaN counts
-          │  upper-bounds{}      │
+          │  content             │    - ORC (.orc)
+          │    DATA              │    - Avro (.avro)
+          │    POSITION_DELETES  │    - Puffin (DV blobs, v3)
+          │    EQUALITY_DELETES  │
+          │  partition           │    Per-column stats:
+          │  record-count        │    - null counts
+          │  file-size-in-bytes  │    - NaN counts
+          │  column-sizes{}      │    - lower/upper bounds
+          │  value-counts{}      │
+          │  null-value-counts{} │    Row lineage (v3, data files):
+          │  nan-value-counts{}  │    - first-row-id
+          │  lower-bounds{}      │
+          │  upper-bounds{}      │    DeleteFile / DV extras:
+          │  equality-ids[]      │    - referenced-data-file
+          │  sort-order-id       │    - content-offset
+          │                      │    - content-size-in-bytes
           └──────────────────────┘
 ```
 
@@ -225,7 +258,8 @@ iceberg/
                         │ schema()     │──────► Schema ──► StructType ──► NestedField[]
                         │ spec()       │──────► PartitionSpec ──► PartitionField[]
                         │ sortOrder()  │──────► SortOrder ──► SortField[]
-                        │ currentSnap()│──────► Snapshot
+                        │ currentSnap- │──────► Snapshot
+                        │   shot()     │
                         │ properties() │
                         │ io()         │──────► FileIO
                         │ location()   │
@@ -252,20 +286,35 @@ iceberg/
                                ┌────────────┘
                                ▼
                      ┌──────────────────────┐
-                     │ SnapshotUpdate<T>    │       (common base for mutations)
+                     │ PendingUpdate<T>     │       (root API)
                      │                      │
-                     │ set(prop, value)     │
-                     │ commit()             │──────► atomic metadata update
-                     │                      │
+                     │  apply() → T         │  preview uncommitted changes
+                     │  commit() ──────────────────► atomic metadata update
                      ├──────────────────────┤
-                     │ AppendFiles          │  add new data files
-                     │ OverwriteFiles       │  replace data files (filter-based)
-                     │ RewriteFiles         │  swap old files for new (compaction)
-                     │ DeleteFiles          │  delete data files by expression
-                     │ RowDelta             │  add data + delete files (MoR)
-                     │ ReplacePartitions    │  dynamic partition overwrite
-                     │ ExpireSnapshots      │  remove old snapshots
-                     │ RewriteManifests     │  optimize manifest files
+                     │ SnapshotUpdate<T>    │       (produces a new snapshot;
+                     │                      │        adds set(prop, value)
+                     │                      │        + commit hooks)
+                     │ ├ AppendFiles        │  add new data files
+                     │ ├ OverwriteFiles     │  replace data files (filter-based)
+                     │ ├ RewriteFiles       │  swap old files for new (compaction)
+                     │ ├ DeleteFiles        │  delete data files by expression
+                     │ ├ RowDelta           │  add data + delete files (MoR)
+                     │ ├ ReplacePartitions  │  dynamic partition overwrite
+                     │ └ RewriteManifests   │  optimize manifest files
+                     ├──────────────────────┤
+                     │ Other PendingUpdates │  (not part of SnapshotUpdate)
+                     │                      │
+                     │ ├ ManageSnapshots    │  PendingUpdate<Snapshot>
+                     │ │                    │   (rollback, cherry-pick,
+                     │ │                    │    branch/tag management;
+                     │ │                    │    may produce a snapshot)
+                     │ ├ ExpireSnapshots    │  PendingUpdate<List<Snapshot>>
+                     │ │                    │   (removes snapshots; no new
+                     │ │                    │    snapshot is produced)
+                     │ ├ UpdateSchema       │  metadata-only: schema evolution
+                     │ ├ UpdatePartitionSpec│  metadata-only: spec evolution
+                     │ ├ UpdateProperties   │  metadata-only: table properties
+                     │ └ UpdateLocation     │  metadata-only: table location
                      └──────────────────────┘
 ```
 
@@ -301,25 +350,38 @@ iceberg/
 │  ├── dropNamespace(namespace)                                    │
 │  └── listNamespaces() → List<Namespace>                          │
 │                                                                  │
+│  interface ViewCatalog        (table-like operations for views)  │
+│  ├── loadView(ident) → View                                      │
+│  ├── buildView(ident) → ViewBuilder                              │
+│  ├── dropView(ident) / renameView(from, to)                      │
+│  └── listViews(namespace)                                        │
+│                                                                  │
 └─────────────────────┬────────────────────────────────────────────┘
                       │
         ┌─────────────┼──────────────┬────────────────┐
         ▼             ▼              ▼                ▼
   ┌────────────┐ ┌───────────┐ ┌────────────┐ ┌──────────────┐
   │ HiveCatalog│ │RESTCatalog│ │JdbcCatalog │ │HadoopCatalog │
-  │            │ │           │ │            │ │(no metastore)│
+  │ hive-      │ │ core/rest │ │ core/jdbc  │ │(no metastore)│
+  │ metastore  │ │           │ │            │ │              │
   │ Hive       │ │ REST API  │ │ JDBC       │ │ filesystem   │
   │ Metastore  │ │ server    │ │ database   │ │ based        │
   └────────────┘ └───────────┘ └────────────┘ └──────────────┘
+
+  Additional implementations: GlueCatalog (aws/glue), NessieCatalog
+  (nessie/), SnowflakeCatalog (snowflake/), BigQueryMetastoreCatalog
+  (bigquery/), DynamoDbCatalog (aws/dynamodb), EcsCatalog (dell/ecs).
+  CachingCatalog (core/) decorates any of the above with a table cache.
+
        │             │             │                │
        └─────────────┴──────┬──────┴────────────────┘
                             ▼
                     ┌────────────────┐
                     │ TableOperations│   Atomic metadata updates
-                    │                │   (CAS on metadata.json)
-                    │ current()      │
-                    │ refresh()      │
-                    │ commit(base,   │
+                    │                │   (HMS: lock+swap, REST: server
+                    │ current()      │    side commit, Hadoop: rename,
+                    │ refresh()      │    JDBC: row CAS, Glue: optimistic
+                    │ commit(base,   │    locking on version-id)
                     │   updated)     │
                     └────────────────┘
 ```
@@ -385,14 +447,17 @@ iceberg/
 ## 7. File Format Integration
 
 ```
-                    ┌───────────────────────┐
-                    │  Engine Layer         │
-                    │                       │
-                    │  SparkParquetReaders  │  (InternalRow <-> Parquet)
-                    │  SparkParquetWriters  │
-                    │  SparkOrcReaders      │
-                    │  SparkAvroReaders     │
-                    └──────────┬────────────┘
+                    ┌────────────────────────────┐
+                    │  Engine Layer              │
+                    │                            │
+                    │  SparkParquetReaders       │  (InternalRow <-> Parquet)
+                    │  SparkParquetWriters       │
+                    │  SparkOrcReader / Writer   │  (singular, OrcRowReader)
+                    │  SparkPlannedAvroReader    │
+                    │  SparkAvroWriter           │
+                    │  VectorizedSparkParquet-   │
+                    │    Readers (Arrow batches) │
+                    └──────────┬─────────────────┘
                                │
                     ┌──────────▼────────────┐
                     │  Format Layer         │
@@ -401,9 +466,17 @@ iceberg/
                     │  Parquet.writeData()  │──► DataWriteBuilder ──► ParquetWriter
                     │  ORC.read()           │──► ReadBuilder ──► OrcIterable
                     │  ORC.write()          │──► WriteBuilder ──► OrcFileAppender
+                    │  Avro.read()          │──► ReadBuilder (record reader
+                    │  Avro.writeData()     │     via PlannedDataReader in
+                    │  Avro.writeDeletes()  │     data/avro; the legacy
+                    │                       │     DataReader is @Deprecated)
                     │                       │
                     │  ParquetValueReader   │  (column-level decode)
                     │  ParquetValueWriter   │  (column-level encode)
+                    │  Parquet variant      │  (shredded Variant; ORC stores
+                    │    readers/writers    │   Variant as metadata/value
+                    │                       │   struct, no shredding)
+                    │  Puffin (core/puffin) │  (statistics + DV blobs)
                     └──────────┬────────────┘
                                │
                     ┌──────────▼────────────┐
@@ -412,6 +485,7 @@ iceberg/
                     │  parquet-mr           │  (ParquetFileReader, ParquetFileWriter)
                     │  orc-core             │
                     │  avro                 │
+                    │  arrow-vector         │  (vectorized read path)
                     └──────────┬────────────┘
                                │
                     ┌──────────▼────────────┐
