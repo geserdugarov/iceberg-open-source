@@ -56,9 +56,12 @@ Both operations use the same two strategies as DELETE (see [delete_mechanisms.md
 │                    │                          │ DELETE)                      │
 ├────────────────────┼──────────────────────────┼──────────────────────────────┤
 │ CoW metadata cols  │ _file + _pos             │ _file only                   │
+│                    │ (+ row lineage cols)     │ (+ row lineage cols)         │
 ├────────────────────┼──────────────────────────┼──────────────────────────────┤
-│ CoW distribution   │ File-aware clustering    │ Standard partition           │
-│                    │ (by _file)               │ clustering                   │
+│ CoW distribution   │ File-aware when          │ Standard append              │
+│                    │ unpartitioned;           │ distribution (partition      │
+│                    │ partition spec when      │ clustering / sort order)     │
+│                    │ partitioned              │                              │
 ├────────────────────┼──────────────────────────┼──────────────────────────────┤
 │ MoR behavior       │ DELETE old + INSERT new  │ DELETE old + INSERT new      │
 │                    │ (identical)              │ + INSERT-only for unmatched  │
@@ -95,7 +98,11 @@ Both operations use the same two strategies as DELETE (see [delete_mechanisms.md
                     ┌──────────▼────────────┐
                     │  SPARK ANALYZER       │
                     │                       │
-                    │  Row lineage rules:   │
+                    │  Iceberg row lineage  │
+                    │  resolution rules     │
+                    │  (v3.5 extensions     │
+                    │  only — not yet in    │
+                    │  v4.0 / v4.1):        │
                     │  RewriteUpdateTable   │
                     │  ForRowLineage        │
                     │  RewriteMergeInto     │
@@ -112,10 +119,12 @@ Both operations use the same two strategies as DELETE (see [delete_mechanisms.md
                     │  SparkRowLevel-       │
                     │  OperationBuilder     │
                     │                       │
-                    │  Read mode from       │
-                    │  table properties:    │
+                    │  Read mode + isolation│
+                    │  from table props:    │
                     │  write.update.mode    │
                     │  write.merge.mode     │
+                    │  write.{op}.isolation │
+                    │  -level               │
                     └──────┬───────┬────────┘
                            │       │
             ┌──────────────┘       └───────────────────┐
@@ -156,37 +165,43 @@ UPDATE catalog.db.table SET value = 'X' WHERE id = 42
 Spark SQL Parser → UpdateTable logical plan               [Spark Core]
        │
        ▼
-RewriteUpdateTableForRowLineage                           [spark-extensions]
-  └─► Inject row lineage assignments:
-        _row_id = _row_id (preserve)
-        _last_updated_sequence_number = null (mark as updated)
+RewriteUpdateTableForRowLineage (resolution rule)         [spark/v3.5/spark-extensions only]
+  └─► When the table supports row lineage, inject extra
+      assignments into the UPDATE action:
+        _row_id = _row_id                       (preserve original ID)
+        _last_updated_sequence_number = null    (mark for next-seq backfill)
        │
        ▼
 SparkTable.newRowLevelOperationBuilder(info)              [spark/source/SparkTable]
-  └─► new SparkRowLevelOperationBuilder(table, info)
+  └─► new SparkRowLevelOperationBuilder(spark, table, branch, info)
         │
-        ├─► mode = tableProperties.get("write.update.mode")
+        ├─► mode = properties.getOrDefault(UPDATE_MODE, UPDATE_MODE_DEFAULT)
         │     → default: "copy-on-write"
+        ├─► isolationLevel = properties.getOrDefault(
+        │       UPDATE_ISOLATION_LEVEL, UPDATE_ISOLATION_LEVEL_DEFAULT)
+        │     → default: "serializable"
         │
-        └─► return new SparkCopyOnWriteOperation(...)     [COPY_ON_WRITE path]
+        └─► return new SparkCopyOnWriteOperation(           [COPY_ON_WRITE path]
+              spark, table, branch, info, isolationLevel)
 
 SparkCopyOnWriteOperation                                [spark/source]
   │
+  ├─► requiredMetadataAttributes() (UPDATE):
+  │     _file (FILE_PATH)                      file identification
+  │     _pos  (ROW_POSITION)                   row-level targeting
+  │     _row_id, _last_updated_sequence_number (when row lineage supported)
+  │
   ├─► SCAN PHASE:
   │     newScanBuilder()
-  │       └─► SparkScanBuilder.buildCopyOnWriteScan()
+  │       └─► anonymous SparkScanBuilder whose build()
+  │           calls super.buildCopyOnWriteScan()
   │             └─► SparkCopyOnWriteScan
-  │                   │
-  │                   ├─► Required metadata:
-  │                   │     _file (FILE_PATH)             file identification
-  │                   │     _pos (ROW_POSITION)           row-level targeting
-  │                   │     _row_id (optional)            row lineage
   │                   │
   │                   ├─► Captures scan snapshot ID
   │                   │     (baseline for conflict detection)
   │                   │
   │                   └─► Supports runtime filtering:
-  │                         Spark pushes In(_file_path, [list])
+  │                         Spark pushes In(_file, [list])
   │                         to narrow scan to only affected files
   │
   ├─► SPARK EXECUTION:
@@ -200,47 +215,60 @@ SparkCopyOnWriteOperation                                [spark/source]
   │
   ├─► WRITE PHASE:
   │     newWriteBuilder()
-  │       └─► SparkWriteBuilder.overwriteFiles(scan, command)
+  │       └─► SparkWriteBuilder.overwriteFiles(scan, command, isolationLevel)
   │             └─► SparkWrite.CopyOnWriteOperation
   │
-  │     Distribution (SparkWriteUtil):
-  │       UPDATE uses file-aware distribution:
-  │         HASH mode: cluster by (_file) or (_file, _partition)
-  │         RANGE mode: order by (_file, _pos)
-  │         → groups rows from same file together for efficient rewrite
+  │     Distribution (SparkWriteUtil.copyOnWriteRequirements,
+  │                   delegating to copyOnWriteDeleteUpdateDistribution
+  │                   for UPDATE and DELETE):
+  │       HASH mode:
+  │         partitioned table   → cluster by table.spec() transforms
+  │                              (NOT file-aware: rows from the same file
+  │                               may land in different tasks; this groups
+  │                               by partition for write locality)
+  │         unpartitioned table → cluster by _file (FILE_CLUSTERING)
+  │                              (file-aware: groups same-file rows)
+  │       RANGE mode:
+  │         partitioned / sorted table → order by SortOrderUtil.buildSortOrder
+  │         otherwise                  → order by (_file, _pos)
+  │       → on the unpartitioned path, groups rows from the same file
+  │         together for efficient rewrite; on the partitioned path the
+  │         grouping is partition-level only
   │
   │     Writers:
   │       Same writer infrastructure as INSERT
-  │       (UnpartitionedDataWriter / PartitionedDataWriter)
+  │       (clustered / fanout data writers via SparkFileWriterFactory)
   │       → produce new Parquet data files
   │
   └─► COMMIT PHASE:
         SparkWrite.CopyOnWriteOperation.commit()         [spark/source/SparkWrite]
           │
-          ├─► Collect overwrittenFiles from scan tasks:
-          │     (original data files that were read and rewritten)
+          ├─► Collect overwrittenFiles + danglingDVs from scan tasks
+          │     (original data files that were read and rewritten,
+          │      plus any DVs that referenced only those files)
           │
           ├─► OverwriteFiles overwrite = table.newOverwrite()
           │
-          ├─► overwrite.deleteFiles(overwrittenFiles)     remove old files
+          ├─► overwrite.deleteFiles(overwrittenFiles, danglingDVs)
           │
           ├─► for each new DataFile:
-          │     overwrite.addFile(newFile)                 add rewritten files
+          │     overwrite.addFile(newFile)
           │
-          ├─► Validation (depends on isolation level):
+          ├─► Validation (depends on isolation level; skipped only when
+          │   the optimizer replaced the scan with an empty relation):
           │     │
-          │     ├─► SERIALIZABLE:
+          │     ├─► SERIALIZABLE  (commitWithSerializableIsolation):
           │     │     overwrite.validateFromSnapshot(scanSnapshotId)
-          │     │     overwrite.conflictDetectionFilter(combinedFilter)
+          │     │     overwrite.conflictDetectionFilter(filter)
           │     │     overwrite.validateNoConflictingData()
           │     │     overwrite.validateNoConflictingDeletes()
           │     │
-          │     └─► SNAPSHOT:
+          │     └─► SNAPSHOT       (commitWithSnapshotIsolation):
           │           overwrite.validateFromSnapshot(scanSnapshotId)
-          │           overwrite.conflictDetectionFilter(combinedFilter)
+          │           overwrite.conflictDetectionFilter(filter)
           │           overwrite.validateNoConflictingDeletes()
           │
-          └─► overwrite.commit()
+          └─► commitOperation(overwrite, msg)
                 └─► SnapshotProducer.commit()
                       atomic CAS on metadata.json
 ```
@@ -298,23 +326,32 @@ Spark SQL Parser → MergeIntoTable logical plan            [Spark Core]
   │  notMatchedBySourceActions: []
        │
        ▼
-RewriteMergeIntoTableForRowLineage                        [spark-extensions]
-  └─► For each UpdateAction:
-        Inject: _row_id = _row_id, _last_updated_sequence_number = null
+RewriteMergeIntoTableForRowLineage (resolution rule)      [spark/v3.5/spark-extensions only]
+  └─► When the table supports row lineage, inject lineage assignments
+      into matchedActions (UPDATE) and notMatchedBySourceActions (UPDATE):
+        _row_id = _row_id
+        _last_updated_sequence_number = null
        │
        ▼
 SparkRowLevelOperationBuilder                             [spark/source]
-  └─► mode = tableProperties.get("write.merge.mode")
+  └─► mode = properties.getOrDefault(MERGE_MODE, MERGE_MODE_DEFAULT)
         → default: "copy-on-write"
-        → return SparkCopyOnWriteOperation(...)
+      isolationLevel = properties.getOrDefault(
+          MERGE_ISOLATION_LEVEL, MERGE_ISOLATION_LEVEL_DEFAULT)
+        → default: "serializable"
+        → return SparkCopyOnWriteOperation(
+              spark, table, branch, info, isolationLevel)
        │
        ▼
 SparkCopyOnWriteOperation                                [spark/source]
   │
+  ├─► requiredMetadataAttributes() (MERGE):
+  │     _file only (_pos is added only for DELETE / UPDATE)
+  │     _row_id, _last_updated_sequence_number (when row lineage supported)
+  │
   ├─► SCAN PHASE:
-  │     SparkCopyOnWriteScan
-  │       Required metadata: _file (for MERGE, no _pos needed)
-  │       Runtime filtering: In(_file_path, [affected files])
+  │     SparkScanBuilder.buildCopyOnWriteScan() → SparkCopyOnWriteScan
+  │       Runtime filtering: In(_file, [affected files])
   │
   ├─► SPARK EXECUTION (JOIN + CLAUSE EVALUATION):
   │     │
@@ -339,20 +376,38 @@ SparkCopyOnWriteOperation                                [spark/source]
   │            + unmatched-target-passthrough + new inserts)
   │
   ├─► WRITE PHASE:
-  │     Distribution (SparkWriteUtil):
-  │       MERGE uses standard partition distribution:
-  │         HASH mode: cluster by (_partition)
-  │         → NOT file-aware (join shuffles rows across files)
+  │     Distribution mode (SparkWriteConf.copyOnWriteMergeDistributionMode):
+  │       1. If write.merge.distribution-mode is set, parse it and run
+  │          through adjustWriteDistributionMode (downgrades range/hash
+  │          to none for unpartitioned/unsorted tables).
+  │       2. Else if the table is partitioned → return HASH
+  │          (NOT range, even when the table has a sort order —
+  │           this is the key difference from the generic
+  │           write.distribution-mode logic, which would pick RANGE
+  │           for any sorted table).
+  │       3. Else (unpartitioned) → return distributionMode(), i.e.
+  │          generic write.distribution-mode / defaultWriteDistributionMode.
   │
-  │     Writers: produce new Parquet data files
+  │     Distribution shape (SparkWriteUtil.copyOnWriteRequirements):
+  │       For MERGE the command is neither DELETE nor UPDATE, so the
+  │       requirements builder falls through to writeRequirements()
+  │       (same shape used by INSERT/APPEND, but driven by the MERGE-
+  │       specific mode above):
+  │         HASH  mode: cluster by table.spec() transforms (no file column)
+  │         RANGE mode: order by SortOrderUtil.buildSortOrder
+  │         NONE  mode: unspecified distribution
+  │       → NOT file-aware (the join shuffles rows across files anyway)
+  │
+  │     Writers: clustered / fanout data writers → new Parquet data files
   │
   └─► COMMIT PHASE:
         Same as CoW UPDATE:
-          OverwriteFiles
-            .deleteFile(affectedFiles...)
-            .addFile(newFiles...)
-            + validation based on isolation level
-            .commit()
+          SparkWrite.CopyOnWriteOperation.commit()
+            OverwriteFiles
+              .deleteFiles(overwrittenFiles, danglingDVs)
+              .addFile(newFiles...)
+              + isolation-level validation (see CoW UPDATE above)
+              .commit()
 ```
 
 ### 4.2 CoW MERGE Data Flow Example
@@ -391,22 +446,27 @@ UPDATE catalog.db.table SET value = 'X' WHERE id = 42
        ▼
 SparkRowLevelOperationBuilder                             [spark/source]
   └─► mode = "merge-on-read"
-        → return SparkPositionDeltaOperation(...)
+        → return SparkPositionDeltaOperation(
+              spark, table, branch, info, isolationLevel)
 
 SparkPositionDeltaOperation                              [spark/source]
   │
-  │  Implements SupportsDelta:
+  │  Implements RowLevelOperation + SupportsDelta:
   │    rowId() = [_file, _pos]                           row identification
   │    representUpdateAsDeleteAndInsert() = true         decompose UPDATE
   │
+  ├─► requiredMetadataAttributes():
+  │     _spec_id                                          partition spec routing
+  │     _partition                                        partition values
+  │     _row_id, _last_updated_sequence_number            (when row lineage)
+  │   (_file and _pos are NOT in requiredMetadataAttributes — they are
+  │    contributed separately through SupportsDelta.rowId().)
+  │
   ├─► SCAN PHASE:
   │     newScanBuilder()
-  │       └─► SparkScanBuilder.buildMergeOnReadScan()
+  │       └─► anonymous SparkScanBuilder whose build()
+  │           calls super.buildMergeOnReadScan()
   │             └─► SparkBatchQueryScan
-  │                   Required metadata:
-  │                     _spec_id                          partition spec routing
-  │                     _partition                        partition values
-  │                     _row_id (optional)                row lineage
   │
   ├─► SPARK EXECUTION (DELTA DECOMPOSITION):
   │     │
@@ -432,37 +492,70 @@ SparkPositionDeltaOperation                              [spark/source]
   │       │
   │       ├─► PositionDeltaWriteFactory.createWriter()
   │       │     │
-  │       │     ├─► if unpartitioned:
-  │       │     │     new UnpartitionedDeltaWriter(dataWriter, deleteWriter)
+  │       │     ├─► if command == DELETE (plain SQL DELETE only —
+  │       │     │   MERGE never takes this branch, even when every
+  │       │     │   clause is DELETE):
+  │       │     │     DeleteOnlyDeltaWriter (no data writer)
   │       │     │
-  │       │     └─► if partitioned:
-  │       │           new PartitionedDeltaWriter(dataWriter, deleteWriter)
+  │       │     ├─► elif unpartitioned:
+  │       │     │     UnpartitionedDeltaWriter
+  │       │     │
+  │       │     └─► else (partitioned):
+  │       │           PartitionedDeltaWriter
   │       │
-  │       │  Each delta writer has TWO sub-writers:
-  │       │    dataWriter:   writes new data files (INSERT rows)
-  │       │    deleteWriter: writes delete files (DELETE markers)
+  │       │  All three are inner classes of SparkPositionDeltaWrite.
+  │       │  Each delta writer composes sub-writers:
+  │       │    dataWriter   (BaseDeltaWriter.newDataWriter)
+  │       │      → ClusteredDataWriter or FanoutDataWriter
+  │       │    deleteWriter (BaseDeltaWriter.newDeleteWriter)
   │       │
-  │       ├─► Delete writer selection:
+  │       ├─► Delete writer selection (BaseDeltaWriter.newDeleteWriter):
   │       │     │
   │       │     ├─► if context.useDVs():                 V3+ table
   │       │     │     PartitioningDVWriter
   │       │     │       → Puffin file with RoaringBitmap blobs
+  │       │     │       → also handles merging previous DVs via the
+  │       │     │         PreviousDeleteLoader passed to the writer
   │       │     │
-  │       │     ├─► elif inputOrdered && no rewritable deletes:
+  │       │     ├─► elif inputOrdered && rewritableDeletes == null:
   │       │     │     ClusteredPositionDeleteWriter       V2 table
   │       │     │       → Parquet file with (file_path, pos)
   │       │     │
   │       │     └─► else:
-  │       │           FanoutPositionOnlyDeleteWriter      V2 unordered
-  │       │           → per-file Parquet delete files
+  │       │           FanoutPositionOnlyDeleteWriter      non-DV path:
+  │       │           → per-file Parquet delete files     input is unordered
+  │       │             (also receives a                   OR rewritableDeletes
+  │       │              PreviousDeleteLoader to           is non-null (merging
+  │       │              merge file-scoped position        previous file-scoped
+  │       │              delete files when present)        position deletes)
   │       │
-  │       └─► Distribution (SparkWriteUtil):
-  │             HASH mode: cluster by (_spec_id, _partition, _file)
-  │             Ordering: (_spec_id, _partition, _file, _pos)
-  │             → groups delete markers by file for efficient delete files
+  │       └─► Distribution (SparkWriteUtil.positionDeltaRequirements,
+  │             delegating to positionDeltaUpdateMergeDistribution for
+  │             UPDATE and MERGE):
+  │             HASH mode:
+  │               partitioned tbl   → cluster by (_spec_id, _partition)
+  │                                  ++ table.spec() transforms
+  │               unpartitioned tbl → cluster by
+  │                                  (_spec_id, _partition, _file)
+  │                                  ++ table.spec() transforms
+  │             Local ordering (positionDeltaUpdateMergeOrdering):
+  │               if fanoutEnabled AND table.sortOrder().isUnsorted():
+  │                 EMPTY_ORDERING (no local ordering)
+  │                 → input arrives unordered. On the NON-DV path this
+  │                   makes BaseDeltaWriter.newDeleteWriter fall to
+  │                   FanoutPositionOnlyDeleteWriter; when context.useDVs()
+  │                   is true (V3+ tables) PartitioningDVWriter is still
+  │                   chosen regardless of ordering.
+  │               else:
+  │                 (_spec_id, _partition, _file, _pos)
+  │                 ++ table sort order
+  │                 → groups delete markers by file. On the NON-DV path
+  │                   this lets ClusteredPositionDeleteWriter run; on the
+  │                   DV path the writer is still PartitioningDVWriter.
   │
   └─► COMMIT PHASE:
-        SparkPositionDeltaWrite.commit(messages)         [spark/source]
+        PositionDeltaBatchWrite.commit(messages)         [spark/source/
+                                                          SparkPositionDeltaWrite]
           │
           ├─► RowDelta rowDelta = table.newRowDelta()
           │
@@ -474,18 +567,29 @@ SparkPositionDeltaOperation                              [spark/source]
           │     ├─► for each DeleteFile in message.deleteFiles():
           │     │     rowDelta.addDeletes(deleteFile)     position deletes / DVs
           │     │
-          │     └─► for each DeleteFile in message.rewrittenDeleteFiles():
-          │           rowDelta.removeDeletes(deleteFile)  cleanup merged DVs
+          │     ├─► for each DeleteFile in message.rewrittenDeleteFiles():
+          │     │     rowDelta.removeDeletes(deleteFile)  drop any delete file
+          │     │                                         being replaced — DVs
+          │     │                                         OR file-scoped position
+          │     │                                         delete files that were
+          │     │                                         merged into the new
+          │     │                                         output
+          │     │
+          │     └─► referencedDataFiles += message.referencedDataFiles()
           │
-          ├─► rowDelta.validateDataFilesExist(referencedDataFiles)
-          │
-          ├─► Validation (UPDATE-specific):
-          │     rowDelta.validateDeletedFiles()
-          │     rowDelta.validateNoConflictingDeleteFiles()
-          │     if SERIALIZABLE:
+          ├─► Validation (skipped only when the optimizer replaced the
+          │   scan with an empty relation):
+          │     rowDelta.conflictDetectionFilter(filter)           (always)
+          │     rowDelta.validateDataFilesExist(referencedDataFiles)
+          │     if scan.snapshotId() != null:
+          │       rowDelta.validateFromSnapshot(scan.snapshotId())
+          │     if command == UPDATE or command == MERGE:
+          │       rowDelta.validateDeletedFiles()
+          │       rowDelta.validateNoConflictingDeleteFiles()
+          │     if isolationLevel == SERIALIZABLE:
           │       rowDelta.validateNoConflictingDataFiles()
           │
-          └─► rowDelta.commit()
+          └─► commitOperation(rowDelta, msg)
                 └─► SnapshotProducer.commit()
 ```
 
@@ -560,30 +664,32 @@ SparkPositionDeltaOperation                              [spark/source]
   ├─► WRITE PHASE:
   │     SparkPositionDeltaWrite
   │       │
-  │       ├─► Writer selection:
+  │       ├─► The PositionDeltaWriteFactory `command == DELETE` branch
+  │       │   only fires for plain SQL DELETE; MERGE — including a
+  │       │   MERGE whose only clause is DELETE — always goes through
+  │       │   the unpartitioned / partitioned writer below, which
+  │       │   carries a dataWriter even when no inserts are emitted.
   │       │     │
-  │       │     ├─► if command == DELETE (pure delete MERGE):
-  │       │     │     DeleteOnlyDeltaWriter
-  │       │     │       only deleteWriter (no dataWriter)
-  │       │     │
-  │       │     ├─► if unpartitioned:
-  │       │     │     UnpartitionedDeltaWriter
+  │       │     ├─► unpartitioned table → UnpartitionedDeltaWriter
   │       │     │       dataWriter + deleteWriter
   │       │     │
-  │       │     └─► if partitioned:
-  │       │           PartitionedDeltaWriter
-  │       │           dataWriter + deleteWriter
-  │       │           routes to partition-specific writers
+  │       │     └─► partitioned table   → PartitionedDeltaWriter
+  │       │           dataWriter + deleteWriter, routed per partition
   │       │
   │       └─► DeltaTaskCommit output:
-  │             dataFiles[]              new inserts + update inserts
+  │             dataFiles[]              new inserts + update-inserts
   │             deleteFiles[]            position deletes / DVs for matched rows
-  │             rewrittenDeleteFiles[]   old DVs being replaced (if merging)
-  │             referencedDataFiles[]    files referenced by delete markers
+  │             rewrittenDeleteFiles[]   any delete files being replaced —
+  │                                       DVs or file-scoped position delete
+  │                                       files that were merged into the
+  │                                       new output
+  │             referencedDataFiles[]    data files referenced by delete markers
   │
   └─► COMMIT PHASE:
-        Same as MoR UPDATE:
-          RowDelta with validation
+        Identical to MoR UPDATE — RowDelta with the same validation chain
+        (conflictDetectionFilter, validateDataFilesExist, validateFromSnapshot,
+         validateDeletedFiles + validateNoConflictingDeleteFiles for UPDATE/MERGE,
+         and validateNoConflictingDataFiles when isolation is SERIALIZABLE).
 ```
 
 ### 6.2 MoR MERGE Data Flow Example
@@ -634,21 +740,29 @@ Commit: RowDelta
 | `_partition`                    | `MetadataColumns.PARTITION_COLUMN_NAME`        | struct  | Partition values for routing          |
 | `_row_id`                       | `MetadataColumns.ROW_ID`                       | long    | Row lineage identity (optional)       |
 | `_last_updated_sequence_number` | `MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER` | long    | Last modification tracking (optional) |
-| `_is_deleted`                   | `MetadataColumns.IS_DELETED`                   | boolean | Delete marking for changelogs         |
+| `_deleted`                      | `MetadataColumns.IS_DELETED`                   | boolean | Delete marking for changelogs (column name is `_deleted`; the constant in `MetadataColumns` is `IS_DELETED`) |
 
 ### 7.2 Which Columns Are Used Where
+
+In CoW the operation's `requiredMetadataAttributes()` lists every metadata
+column the planner must project. In MoR `requiredMetadataAttributes()` only
+lists `_spec_id` and `_partition` (plus row lineage columns when enabled);
+`_file` and `_pos` are contributed separately through
+`SupportsDelta.rowId()`.
 
 ```
 ┌──────────────────┬───────────────────────┬───────────────────────┐
 │  Metadata Column │  CoW                  │  MoR                  │
 ├──────────────────┼───────────────────────┼───────────────────────┤
-│  _file           │  UPDATE: yes (dist.)  │  yes (rowId)          │
+│  _file           │  UPDATE: yes (scan +  │  yes (rowId)          │
+│                  │   distribution)       │                       │
 │                  │  MERGE: yes (scan)    │                       │
 ├──────────────────┼───────────────────────┼───────────────────────┤
-│  _pos            │  UPDATE: yes (dist.)  │  yes (rowId)          │
+│  _pos            │  UPDATE: yes (scan +  │  yes (rowId)          │
+│                  │   distribution)       │                       │
 │                  │  MERGE: no            │                       │
 ├──────────────────┼───────────────────────┼───────────────────────┤
-│  _spec_id        │  no                   │  yes (partition       │
+│  _spec_id        │  no                   │  yes (partition spec  │
 │                  │                       │   routing)            │
 ├──────────────────┼───────────────────────┼───────────────────────┤
 │  _partition      │  no                   │  yes (partition       │
@@ -663,16 +777,51 @@ Commit: RowDelta
 
 ### 7.3 Row Lineage
 
-When a table supports row lineage (V3+ with row lineage enabled), Spark's analyzer rules inject additional assignments into UPDATE and MERGE actions:
+When the table supports row lineage (detected via
+`TableUtil.supportsRowLineage(table)`, which simply checks the table is
+not a metadata table and its format version is `>= MIN_FORMAT_VERSION_ROW_LINEAGE`
+— currently `3`; there is no separate feature flag in this code path),
+the Iceberg-injected analyzer rules add lineage projections and
+assignments to UPDATE and MERGE plans:
 
 ```
-RewriteUpdateTableForRowLineage / RewriteMergeIntoTableForRowLineage:
-  For each UPDATE action:
-    - Add assignment: _row_id = _row_id            (preserve original ID)
-    - Add assignment: _last_updated_sequence_number = null  (mark as updated)
+RewriteUpdateTableForRowLineage:
+  For the UPDATE's assignments, append:
+    - _row_id = _row_id                          (preserve original ID)
+    - _last_updated_sequence_number = null       (backfilled to the new
+                                                  snapshot's sequence
+                                                  number on write)
+
+RewriteMergeIntoTableForRowLineage:
+  Same pair of assignments injected into:
+    - every UPDATE action in matchedActions
+    - every UPDATE action in notMatchedBySourceActions
+
+These rules only rewrite the analyzed UPDATE / MERGE plan; they do NOT
+modify `requiredMetadataAttributes()`. The lineage metadata columns are
+appended independently by SparkCopyOnWriteOperation.requiredMetadataAttributes()
+and SparkPositionDeltaOperation.requiredMetadataAttributes(), each of
+which calls TableUtil.supportsRowLineage(table) and, when true, adds
+_row_id and _last_updated_sequence_number — so the runtime projection
+happens on every Spark version that includes those operation classes,
+even on builds where the analyzer-side rewrite rules are absent.
 ```
 
-This enables downstream consumers to track row identity across updates.
+Both rules are registered via `injectResolutionRule` in
+`IcebergSparkSessionExtensions` in the **Spark 3.5 extensions module
+only** (`spark/v3.5/spark-extensions`). At the time of writing, the
+`spark/v4.0/spark-extensions` and `spark/v4.1/spark-extensions` modules
+do not contain or register `RewriteUpdateTableForRowLineage` /
+`RewriteMergeIntoTableForRowLineage`, so the assignment-injection
+behaviour described here is Spark-3.5-only on the current branch. The
+runtime-side row-lineage projections in
+`SparkCopyOnWriteOperation.requiredMetadataAttributes()` and
+`SparkPositionDeltaOperation.requiredMetadataAttributes()` still apply
+on v4.0 / v4.1 whenever `TableUtil.supportsRowLineage(table)` returns
+true.
+
+This lets downstream consumers track row identity and last-modification
+order across updates.
 
 ---
 
@@ -763,53 +912,102 @@ WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (s.sku, s.qty)  -- clause 3: new 
 
 **Merge-on-Read (RowDelta):**
 
+The MoR commit always sets `conflictDetectionFilter` and calls
+`validateDataFilesExist`. `validateFromSnapshot` is called whenever the
+scan captured a snapshot ID. `validateDeletedFiles` and
+`validateNoConflictingDeleteFiles` are added for UPDATE and MERGE (not for
+DELETE). `validateNoConflictingDataFiles` is added only when the isolation
+level is SERIALIZABLE.
+
 | Isolation      | Validation Steps                                                                         |
 |----------------|------------------------------------------------------------------------------------------|
-| `serializable` | `validateFromSnapshot(scanSnapshotId)`                                                   |
+| `serializable` | `conflictDetectionFilter(filter)`                                                        |
 |                | `validateDataFilesExist(referencedDataFiles)`                                            |
-|                | `validateDeletedFiles()` — ensures data files not deleted concurrently                   |
+|                | `validateFromSnapshot(scanSnapshotId)` (when the scan has a snapshot)                    |
+|                | `validateDeletedFiles()` — ensures referenced data files not deleted concurrently        |
 |                | `validateNoConflictingDeleteFiles()` — fails if concurrent deletes on same rows          |
 |                | `validateNoConflictingDataFiles()` — fails if concurrent INSERT into affected partitions |
-| `snapshot`     | `validateFromSnapshot(scanSnapshotId)`                                                   |
+| `snapshot`     | `conflictDetectionFilter(filter)`                                                        |
 |                | `validateDataFilesExist(referencedDataFiles)`                                            |
+|                | `validateFromSnapshot(scanSnapshotId)` (when the scan has a snapshot)                    |
 |                | `validateDeletedFiles()`                                                                 |
 |                | `validateNoConflictingDeleteFiles()`                                                     |
 
 ### 9.3 Concurrent Operation Scenario Matrix
 
 ```
-┌───────────────────────────────┬──────────────┬──────────────┐
-│  Concurrent Operation         │ SERIALIZABLE │ SNAPSHOT     │
-├───────────────────────────────┼──────────────┼──────────────┤
-│ INSERT into same partition    │ FAILS        │ SUCCEEDS     │
-│ INSERT into other partition   │ SUCCEEDS     │ SUCCEEDS     │
-│ DELETE on same partition      │ FAILS        │ FAILS        │
-│ UPDATE on same partition      │ FAILS        │ FAILS        │
-│ MERGE on different partitions │ SUCCEEDS     │ SUCCEEDS     │
-│ Compaction on affected files  │ FAILS        │ FAILS        │
-└───────────────────────────────┴──────────────┴──────────────┘
+┌─────────────────────────────────────────┬──────────────┬──────────────┐
+│  Concurrent Operation                   │ SERIALIZABLE │ SNAPSHOT     │
+├─────────────────────────────────────────┼──────────────┼──────────────┤
+│ INSERT into same partition / filter     │ FAILS        │ SUCCEEDS     │
+│ INSERT into clearly other partition     │ SUCCEEDS     │ SUCCEEDS     │
+│ DELETE on same data files               │ FAILS        │ FAILS        │
+│ UPDATE / MERGE on same data files       │ FAILS        │ FAILS        │
+│ UPDATE / MERGE on clearly other parts.  │ SUCCEEDS     │ SUCCEEDS     │
+│ Compaction on affected files            │ FAILS        │ FAILS        │
+└─────────────────────────────────────────┴──────────────┴──────────────┘
 
-FAILS = commit is rejected, retried with exponential backoff
-SUCCEEDS = commits proceed without conflict
+FAILS    = commit is rejected; the engine may retry under
+           `commit.retry.*` policy (see TableProperties).
+SUCCEEDS = no conflict detected.
+
+These outcomes are best-effort, not absolute. Iceberg's validators
+(`validateNoConflictingData`, `validateNoConflictingDeletes`,
+`validateNoConflictingDeleteFiles`, `validateNoConflictingDataFiles`)
+flag any concurrent data / delete file that "can contain" or "can apply
+to" rows matching the `conflictDetectionFilter`. When the validator
+cannot prove file-level disjointness from manifest metrics and the
+filter alone — for example, because the data file's lower / upper bounds
+overlap the filter range, or the filter is broader than the actual rows
+touched — the commit is rejected conservatively even though the two
+operations may not actually overlap at the row level.
 ```
 
 **Key difference:**
-- `SERIALIZABLE`: Prevents phantom reads — no concurrent INSERTs allowed into affected partitions
-- `SNAPSHOT`: Allows concurrent INSERTs (acceptable phantom reads) — only prevents concurrent DELETEs/UPDATEs on the same data
+- `SERIALIZABLE`: Prevents phantom reads — concurrent INSERTs whose
+  partition / file bounds intersect the operation's filter are rejected.
+- `SNAPSHOT`: Tolerates phantom reads — only concurrent DELETEs and
+  delete files whose scope intersects the operation's filter are
+  rejected.
 
 ---
 
 ## 10. Configuration
 
-| Property                       | Default              | Values                           | Scope                                                                |
-|--------------------------------|----------------------|----------------------------------|----------------------------------------------------------------------|
-| `write.update.mode`            | `copy-on-write`      | `copy-on-write`, `merge-on-read` | UPDATE operations                                                    |
-| `write.merge.mode`             | `copy-on-write`      | `copy-on-write`, `merge-on-read` | MERGE operations                                                     |
-| `write.delete.mode`            | `copy-on-write`      | `copy-on-write`, `merge-on-read` | DELETE operations (see [delete_mechanisms.md](delete_mechanisms.md)) |
-| `write.update.isolation-level` | `serializable`       | `serializable`, `snapshot`       | UPDATE conflict detection                                            |
-| `write.merge.isolation-level`  | `serializable`       | `serializable`, `snapshot`       | MERGE conflict detection                                             |
-| `write.distribution-mode`      | `hash`               | `none`, `hash`, `range`          | Shuffle strategy                                                     |
-| `write.target-file-size-bytes` | `536870912` (512 MB) | long                             | Target data file size                                                |
+| Property                            | Default                   | Values                           | Scope                                                                |
+|-------------------------------------|---------------------------|----------------------------------|----------------------------------------------------------------------|
+| `write.update.mode`                 | `copy-on-write`           | `copy-on-write`, `merge-on-read` | UPDATE operations                                                    |
+| `write.merge.mode`                  | `copy-on-write`           | `copy-on-write`, `merge-on-read` | MERGE operations                                                     |
+| `write.delete.mode`                 | `copy-on-write`           | `copy-on-write`, `merge-on-read` | DELETE operations (see [delete_mechanisms.md](delete_mechanisms.md)) |
+| `write.update.isolation-level`      | `serializable`            | `serializable`, `snapshot`       | UPDATE conflict detection                                            |
+| `write.merge.isolation-level`       | `serializable`            | `serializable`, `snapshot`       | MERGE conflict detection                                             |
+| `write.update.distribution-mode`    | `hash`                    | `none`, `hash`, `range`          | UPDATE shuffle (both CoW and MoR; `SparkWriteConf.updateDistributionMode()`) |
+| `write.merge.distribution-mode`     | `hash` (MoR); see below for CoW | `none`, `hash`, `range`    | MERGE shuffle                                                        |
+| `write.delete.distribution-mode`    | `hash`                    | `none`, `hash`, `range`          | DELETE shuffle                                                       |
+| `write.distribution-mode`           | derived (see below)       | `none`, `hash`, `range`          | Generic write shuffle for INSERT/APPEND and the CoW MERGE fallback   |
+| `write.target-file-size-bytes`      | `536870912` (512 MB)      | long                             | Target data file size                                                |
+
+`SparkWriteConf` reads the row-level distribution modes via dedicated methods:
+
+- `updateDistributionMode()` — used by both CoW and MoR UPDATE; defaults to `hash`.
+- `positionDeltaMergeDistributionMode()` — used by MoR MERGE; defaults to `hash`.
+- `copyOnWriteMergeDistributionMode()` — used by CoW MERGE. If
+  `write.merge.distribution-mode` is set, that value is parsed and run
+  through `adjustWriteDistributionMode` (which downgrades `range`/`hash`
+  to `none` on unpartitioned/unsorted tables). If it is unset, the
+  method falls back to `HASH` for partitioned tables and to the generic
+  `distributionMode()` / `defaultWriteDistributionMode()` derivation for
+  unpartitioned tables.
+- `deleteDistributionMode()` — used by both CoW and MoR DELETE; defaults to `hash`.
+
+`write.distribution-mode` itself is only directly consulted on the
+INSERT/APPEND path and the CoW MERGE fallback. When unset,
+`SparkWriteConf.defaultWriteDistributionMode()` returns `range` for sorted
+tables, `hash` for partitioned tables, and `none` otherwise;
+`adjustWriteDistributionMode` further downgrades `range` to `none` for
+unpartitioned/unsorted tables and `hash` to `none` for unpartitioned
+tables. The dedicated UPDATE/MERGE/DELETE properties above do NOT go
+through that derivation — they default to `hash` directly.
 
 Set via table properties:
 ```sql
@@ -824,28 +1022,45 @@ ALTER TABLE catalog.db.table SET TBLPROPERTIES (
 
 ## 11. Key Classes Reference
 
-| Step                  | Class                                | Module           | Key Method                                                 |
-|-----------------------|--------------------------------------|------------------|------------------------------------------------------------|
-| **Entry point**       | `SparkTable`                         | spark/source     | `newRowLevelOperationBuilder()`                            |
-| **Mode dispatch**     | `SparkRowLevelOperationBuilder`      | spark/source     | `build()` — reads mode from table properties               |
-| **CoW operation**     | `SparkCopyOnWriteOperation`          | spark/source     | `newScanBuilder()`, `newWriteBuilder()`                    |
-| **CoW scan**          | `SparkCopyOnWriteScan`               | spark/source     | `planFiles()`, runtime filtering support                   |
-| **CoW commit**        | `SparkWrite.CopyOnWriteOperation`    | spark/source     | `commit()` — OverwriteFiles with validation                |
-| **MoR operation**     | `SparkPositionDeltaOperation`        | spark/source     | `rowId()`, `representUpdateAsDeleteAndInsert()`            |
-| **MoR write**         | `SparkPositionDeltaWrite`            | spark/source     | `toBatch()` → `PositionDeltaBatchWrite`                    |
-| **MoR commit**        | `SparkPositionDeltaWrite`            | spark/source     | `commit()` — RowDelta with validation                      |
-| **Delta commit msg**  | `DeltaTaskCommit`                    | spark/source     | `dataFiles[]`, `deleteFiles[]`, `rewrittenDeleteFiles[]`   |
-| **MoR writers**       | `UnpartitionedDeltaWriter`           | spark/source     | Unpartitioned UPDATE/MERGE                                 |
-|                       | `PartitionedDeltaWriter`             | spark/source     | Partitioned UPDATE/MERGE                                   |
-|                       | `DeleteOnlyDeltaWriter`              | spark/source     | DELETE-only MERGE clauses                                  |
-| **DV writer**         | `PartitioningDVWriter`               | core/io          | V3+ deletion vector writing                                |
-| **Pos delete writer** | `ClusteredPositionDeleteWriter`      | core/io          | V2 ordered position deletes                                |
-|                       | `FanoutPositionOnlyDeleteWriter`     | core/io          | V2 unordered position deletes                              |
-| **Distribution**      | `SparkWriteUtil`                     | spark            | `copyOnWriteRequirements()`, `positionDeltaRequirements()` |
-| **Row lineage**       | `RewriteUpdateTableForRowLineage`    | spark-extensions | Injects row lineage into UPDATE                            |
-|                       | `RewriteMergeIntoTableForRowLineage` | spark-extensions | Injects row lineage into MERGE                             |
-| **CoW commit API**    | `OverwriteFiles`                     | api              | `deleteFile()`, `addFile()`, `validateNoConflictingData()` |
-| **MoR commit API**    | `RowDelta`                           | api              | `addRows()`, `addDeletes()`, `validateDeletedFiles()`      |
-| **Isolation**         | `IsolationLevel`                     | core             | `SERIALIZABLE`, `SNAPSHOT`                                 |
-| **Config**            | `TableProperties`                    | core             | `UPDATE_MODE`, `MERGE_MODE`, isolation levels              |
-| **Write config**      | `SparkWriteConf`                     | spark            | `updateMode()`, `mergeMode()`, `updateIsolationLevel()`    |
+All Spark-side class paths below refer to the live `spark/v3.5/spark`
+module; the equivalent classes also exist under `spark/v4.0/spark` and
+`spark/v4.1/spark`.
+
+The row-lineage rewrite rules (`RewriteUpdateTableForRowLineage` and
+`RewriteMergeIntoTableForRowLineage`, registered via
+`IcebergSparkSessionExtensions`) currently live ONLY under
+`spark/v3.5/spark-extensions`. The `spark/v4.0/spark-extensions` and
+`spark/v4.1/spark-extensions` modules do not contain or register these
+rules, so the row-lineage assignment injection described above is a
+Spark 3.5 behavior at the moment.
+
+| Step                  | Class                                                      | Module           | Notes                                                                  |
+|-----------------------|------------------------------------------------------------|------------------|------------------------------------------------------------------------|
+| **Entry point**       | `SparkTable`                                               | spark/source     | `newRowLevelOperationBuilder()` returns SparkRowLevelOperationBuilder  |
+| **Mode dispatch**     | `SparkRowLevelOperationBuilder`                            | spark/source     | `build()` reads mode + isolation from table properties                 |
+| **CoW operation**     | `SparkCopyOnWriteOperation`                                | spark/source     | `requiredMetadataAttributes()`, `newScanBuilder`, `newWriteBuilder`    |
+| **CoW scan**          | `SparkCopyOnWriteScan`                                     | spark/source     | Built via `SparkScanBuilder.buildCopyOnWriteScan()`                    |
+| **CoW write builder** | `SparkWriteBuilder`                                        | spark/source     | `overwriteFiles(scan, command, isolationLevel)`                        |
+| **CoW commit**        | `SparkWrite.CopyOnWriteOperation`                          | spark/source     | `commit()` → OverwriteFiles with `commitWith{Serializable,Snapshot}Isolation` |
+| **MoR operation**     | `SparkPositionDeltaOperation`                              | spark/source     | `rowId()`, `representUpdateAsDeleteAndInsert()`                        |
+| **MoR scan**          | `SparkBatchQueryScan`                                      | spark/source     | Built via `SparkScanBuilder.buildMergeOnReadScan()`                    |
+| **MoR write builder** | `SparkPositionDeltaWriteBuilder`                           | spark/source     | Produces `SparkPositionDeltaWrite`                                     |
+| **MoR write**         | `SparkPositionDeltaWrite`                                  | spark/source     | `toBatch()` → `PositionDeltaBatchWrite.commit()` with RowDelta         |
+| **Delta commit msg**  | `SparkPositionDeltaWrite.DeltaTaskCommit`                  | spark/source     | `dataFiles`, `deleteFiles`, `rewrittenDeleteFiles`, `referencedDataFiles` |
+| **MoR writers**       | `SparkPositionDeltaWrite.UnpartitionedDeltaWriter`         | spark/source     | Inner class; unpartitioned UPDATE/MERGE                                |
+|                       | `SparkPositionDeltaWrite.PartitionedDeltaWriter`           | spark/source     | Inner class; partitioned UPDATE/MERGE                                  |
+|                       | `SparkPositionDeltaWrite.DeleteOnlyDeltaWriter`            | spark/source     | Inner class; only used when command == DELETE (plain SQL DELETE) — MERGE never selects this path |
+| **DV writer**         | `PartitioningDVWriter`                                     | core/io          | V3+ deletion vector writing; also merges previous DVs via the `PreviousDeleteLoader` it receives |
+| **Pos delete writer** | `ClusteredPositionDeleteWriter`                            | core/io          | Ordered (non-DV) position deletes — chosen when input is ordered and no rewritable deletes |
+|                       | `FanoutPositionOnlyDeleteWriter`                           | core/io          | Non-DV fallback: input is unordered OR rewritable file-scoped position delete files must be merged in (NOT used for DV merging — that stays on the `PartitioningDVWriter` path) |
+| **Distribution**      | `SparkWriteUtil`                                           | spark            | `copyOnWriteRequirements()`, `positionDeltaRequirements()`             |
+| **Row lineage**       | `RewriteUpdateTableForRowLineage`                          | spark/v3.5/spark-extensions only | Injects row lineage assignments into UPDATE (not present in v4.0 / v4.1 extensions yet) |
+|                       | `RewriteMergeIntoTableForRowLineage`                       | spark/v3.5/spark-extensions only | Injects row lineage assignments into MERGE matched / not-matched-by-source actions (not present in v4.0 / v4.1 extensions yet) |
+|                       | `IcebergSparkSessionExtensions`                            | spark-extensions | In v3.5, registers both rules via `injectResolutionRule`               |
+| **CoW commit API**    | `OverwriteFiles`                                           | api              | `deleteFiles`, `addFile`, `conflictDetectionFilter`, `validateNoConflictingData`, `validateNoConflictingDeletes` |
+| **MoR commit API**    | `RowDelta`                                                 | api              | `addRows`, `addDeletes`, `removeDeletes`, `conflictDetectionFilter`, `validateDataFilesExist`, `validateDeletedFiles`, `validateNoConflictingDeleteFiles`, `validateNoConflictingDataFiles` |
+| **Commit base**       | `SnapshotProducer` / `MergingSnapshotProducer`             | core             | Underlies both OverwriteFiles and RowDelta commits                     |
+| **Isolation**         | `IsolationLevel`                                           | core             | `SERIALIZABLE`, `SNAPSHOT`                                             |
+| **Mode enum**         | `RowLevelOperationMode`                                    | core             | `COPY_ON_WRITE`, `MERGE_ON_READ`                                       |
+| **Config**            | `TableProperties`                                          | core             | `UPDATE_MODE` / `MERGE_MODE` (+ `_DEFAULT`), `*_ISOLATION_LEVEL` (+ `_DEFAULT`) |
+| **Row-lineage check** | `TableUtil.supportsRowLineage(table)`                      | core             | Gates row-lineage injection in both rewrite rules and operations       |
